@@ -19,7 +19,7 @@ jobs:
       - name: Sync with upstream
         uses: XueMoMo/Sync-Fork-action@v1.0.6
         with:
-          github_token: ${{ secrets.SYNC_PAT }}
+          github_token: ${{ secrets.SYNCFORK }}
           upstream_repository: jellyfin/jellyfin-desktop
           upstream_branch: main
           target_branch: main
