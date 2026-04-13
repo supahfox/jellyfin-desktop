@@ -14,12 +14,12 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.SYNCFORK }}
 
       - name: Sync with upstream
         uses: XueMoMo/Sync-Fork-action@v1.0.6
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.SYNC_PAT }}
           upstream_repository: jellyfin/jellyfin-desktop
           upstream_branch: main
           target_branch: main
