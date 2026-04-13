@@ -20,7 +20,7 @@ jobs:
         uses: XueMoMo/Sync-Fork-action@v1.0.6
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          upstream_repository: Vendicated/Vencord
+          upstream_repository: jellyfin/jellyfin-desktop
           upstream_branch: main
           target_branch: main
           git_fetch_args: --recurse-submodules
