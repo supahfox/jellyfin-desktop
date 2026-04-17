@@ -46,7 +46,7 @@
 
             // Use defineProperty to avoid circular reference in JSON.stringify
             Object.defineProperty(this, '_core', {
-                value: new window.MpvPlayerCore(events),
+                value: new window.MpvPlayerCore(events, appSettings),
                 writable: true,
                 enumerable: false
             });
@@ -136,10 +136,6 @@
             return await this.setCurrentSrc(options);
         }
 
-        getSavedVolume() {
-            return this.appSettings.get('volume') || 1;
-        }
-
         setCurrentSrc(options) {
             return new Promise((resolve) => {
                 const val = options.url;
@@ -174,6 +170,7 @@
                     }
                 }
 
+                window.api.player.setAspectMode(this.getAspectRatio());
                 window.api.player.load(val,
                     { startMilliseconds: ms, autoplay: true },
                     { type: 'video', metadata: options.item },
@@ -339,32 +336,31 @@
         setBrightness() {}
         getBrightness() { return 100; }
 
-        saveVolume(value) { if (value) this.appSettings.set('volume', value); }
-        setVolume(val, save = true) {
-            val = Number(val);
-            if (!isNaN(val)) {
-                this._core._volume = val;
-                if (save) { this.saveVolume(val / 100); this.events.trigger(this, 'volumechange'); }
-                window.api.player.setVolume(val);
-            }
-        }
+        saveVolume(value) { this._core.saveVolume(value); }
+        getSavedVolume() { return this._core.getSavedVolume(); }
+        setVolume(val, save = true) { this._core.setVolume(val, save); }
         getVolume() { return this._core.getVolume(); }
-        volumeUp() { this.setVolume(Math.min(this.getVolume() + 2, 100)); }
-        volumeDown() { this.setVolume(Math.max(this.getVolume() - 2, 0)); }
+        volumeUp() { this._core.volumeUp(); }
+        volumeDown() { this._core.volumeDown(); }
 
-        setMute(mute, triggerEvent = true) {
-            this._core._muted = mute;
-            window.api.player.setMuted(mute);
-            if (triggerEvent) this.events.trigger(this, 'volumechange');
-        }
+        setMute(mute, triggerEvent = true) { this._core.setMute(mute, triggerEvent); }
         isMuted() { return this._core.isMuted(); }
 
         togglePictureInPicture() {}
         toggleAirPlay() {}
         getStats() { return Promise.resolve({ categories: [] }); }
-        getSupportedAspectRatios() { return []; }
-        getAspectRatio() { return 'normal'; }
-        setAspectRatio(value) {}
+        getSupportedAspectRatios() {
+            return [
+                { id: 'auto',  name: this.globalize.translate('Auto') },
+                { id: 'cover', name: this.globalize.translate('AspectRatioCover') },
+                { id: 'fill',  name: this.globalize.translate('AspectRatioFill') }
+            ];
+        }
+        getAspectRatio() { return this.appSettings.aspectRatio() || 'auto'; }
+        setAspectRatio(value) {
+            this.appSettings.aspectRatio(value);
+            window.api.player.setAspectMode(value);
+        }
     }
 
     window._mpvVideoPlayer = mpvVideoPlayer;

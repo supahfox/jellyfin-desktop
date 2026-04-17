@@ -5,6 +5,7 @@
 #include "browser/overlay_browser.h"
 #include "clipboard/wayland.h"
 #include "idle_inhibit_linux.h"
+#include "open_url_linux.h"
 #include "input/input_wayland.h"
 
 #include <wayland-client.h>
@@ -62,6 +63,13 @@ struct WlState {
     wp_viewport* overlay_viewport = nullptr;
     bool overlay_visible = false;
     bool overlay_placeholder = false;  // true while showing solid-color placeholder
+
+    // Popup subsurface (CEF OSR popup elements, e.g. <select> dropdowns)
+    wl_surface* popup_surface = nullptr;
+    wl_subsurface* popup_subsurface = nullptr;
+    wl_buffer* popup_buffer = nullptr;
+    wp_viewport* popup_viewport = nullptr;
+    bool popup_visible = false;
 
     // Shared globals
     wl_shm* shm = nullptr;
@@ -319,6 +327,87 @@ static void wl_overlay_present_software(const CefRenderHandler::RectList&,
     wl_display_flush(g_wl.display);
 }
 
+// =====================================================================
+// Popup subsurface (CEF OSR popup elements)
+// =====================================================================
+
+static void wl_popup_show(int x, int y, int lw, int lh) {
+    std::lock_guard<std::mutex> lock(g_wl.surface_mtx);
+    g_wl.popup_visible = true;
+    if (!g_wl.popup_subsurface) return;
+    wl_subsurface_set_position(g_wl.popup_subsurface, x, y);
+    if (g_wl.popup_viewport && lw > 0 && lh > 0)
+        wp_viewport_set_destination(g_wl.popup_viewport, lw, lh);
+}
+
+static void wl_popup_hide() {
+    std::lock_guard<std::mutex> lock(g_wl.surface_mtx);
+    g_wl.popup_visible = false;
+    if (!g_wl.popup_surface) return;
+    wl_surface_attach(g_wl.popup_surface, nullptr, 0, 0);
+    wl_surface_commit(g_wl.popup_surface);
+    wl_display_flush(g_wl.display);
+    if (g_wl.popup_buffer) {
+        wl_buffer_destroy(g_wl.popup_buffer);
+        g_wl.popup_buffer = nullptr;
+    }
+}
+
+static void wl_popup_present(const CefAcceleratedPaintInfo& info, int lw, int lh) {
+    if (lw <= 0 || lh <= 0) return;
+    int w = info.extra.coded_size.width;
+    int h = info.extra.coded_size.height;
+
+    auto* buf = create_dmabuf_buffer(info);
+    if (!buf) return;
+
+    std::lock_guard<std::mutex> lock(g_wl.surface_mtx);
+    if (!g_wl.popup_surface || !g_wl.popup_visible) {
+        wl_buffer_destroy(buf);
+        return;
+    }
+    if (g_wl.popup_buffer) wl_buffer_destroy(g_wl.popup_buffer);
+    g_wl.popup_buffer = buf;
+    if (g_wl.popup_viewport) {
+        wp_viewport_set_source(g_wl.popup_viewport,
+            wl_fixed_from_int(0), wl_fixed_from_int(0),
+            wl_fixed_from_int(w), wl_fixed_from_int(h));
+        wp_viewport_set_destination(g_wl.popup_viewport, lw, lh);
+    }
+    wl_surface_attach(g_wl.popup_surface, buf, 0, 0);
+    wl_surface_damage_buffer(g_wl.popup_surface, 0, 0, w, h);
+    // Commit cef_surface first so set_position takes effect in the
+    // same compositor frame as the popup buffer.
+    wl_surface_commit(g_wl.cef_surface);
+    wl_surface_commit(g_wl.popup_surface);
+    wl_display_flush(g_wl.display);
+}
+
+static void wl_popup_present_software(const void* buffer, int pw, int ph, int lw, int lh) {
+    if (lw <= 0 || lh <= 0) return;
+    auto* buf = create_shm_buffer(buffer, pw, ph);
+    if (!buf) return;
+
+    std::lock_guard<std::mutex> lock(g_wl.surface_mtx);
+    if (!g_wl.popup_surface || !g_wl.popup_visible) {
+        wl_buffer_destroy(buf);
+        return;
+    }
+    if (g_wl.popup_buffer) wl_buffer_destroy(g_wl.popup_buffer);
+    g_wl.popup_buffer = buf;
+    if (g_wl.popup_viewport) {
+        wp_viewport_set_source(g_wl.popup_viewport,
+            wl_fixed_from_int(0), wl_fixed_from_int(0),
+            wl_fixed_from_int(pw), wl_fixed_from_int(ph));
+        wp_viewport_set_destination(g_wl.popup_viewport, lw, lh);
+    }
+    wl_surface_attach(g_wl.popup_surface, buf, 0, 0);
+    wl_surface_damage_buffer(g_wl.popup_surface, 0, 0, pw, ph);
+    wl_surface_commit(g_wl.cef_surface);
+    wl_surface_commit(g_wl.popup_surface);
+    wl_display_flush(g_wl.display);
+}
+
 static void wl_overlay_resize(int lw, int lh, int pw, int ph) {
     std::lock_guard<std::mutex> lock(g_wl.surface_mtx);
     if (!g_wl.overlay_surface || !g_wl.overlay_viewport) return;
@@ -388,9 +477,9 @@ static void wl_set_overlay_visible(bool visible) {
     }
 }
 
-// Wait delay_sec, then animate overlay alpha from opaque to transparent over
-// fade_sec, then hide.  Runs on a detached thread — finite UI animation.
-static void wl_fade_overlay(float delay_sec, float fade_sec,
+// Animate overlay alpha from opaque to transparent over fade_sec, then hide.
+// Runs on a detached thread — finite UI animation.
+static void wl_fade_overlay(float fade_sec,
                             std::function<void()> on_fade_start,
                             std::function<void()> on_complete) {
     if (!g_wl.overlay_alpha || !g_wl.overlay_surface) {
@@ -401,11 +490,9 @@ static void wl_fade_overlay(float delay_sec, float fade_sec,
         return;
     }
 
-    std::thread([delay_sec, fade_sec,
+    std::thread([fade_sec,
                  on_fade_start = std::move(on_fade_start),
                  on_complete = std::move(on_complete)]() {
-        if (delay_sec > 0)
-            std::this_thread::sleep_for(std::chrono::duration<float>(delay_sec));
         if (on_fade_start) on_fade_start();
 
         int fps = g_display_hz.load(std::memory_order_relaxed);
@@ -866,6 +953,22 @@ static bool wl_init(mpv_handle* mpv) {
         g_wl.overlay_alpha = wp_alpha_modifier_v1_get_surface(g_wl.alpha_modifier, g_wl.overlay_surface);
     wl_surface_commit(g_wl.overlay_surface);
 
+    // --- Popup subsurface (child of cef_surface, for CEF OSR <select> dropdowns) ---
+    // Must be a child of cef_surface (not the parent) so that
+    // wl_subsurface_set_position takes effect on cef_surface's commit
+    // rather than waiting for mpv's parent commit, which we don't control.
+    g_wl.popup_surface = wl_compositor_create_surface(g_wl.compositor);
+    g_wl.popup_subsurface = wl_subcompositor_get_subsurface(g_wl.subcompositor, g_wl.popup_surface, g_wl.cef_surface);
+    wl_subsurface_set_desync(g_wl.popup_subsurface);
+    {
+        wl_region* empty = wl_compositor_create_region(g_wl.compositor);
+        wl_surface_set_input_region(g_wl.popup_surface, empty);
+        wl_region_destroy(empty);
+    }
+    if (g_wl.viewporter)
+        g_wl.popup_viewport = wp_viewporter_get_viewport(g_wl.viewporter, g_wl.popup_surface);
+    wl_surface_commit(g_wl.popup_surface);
+
     wl_display_roundtrip_queue(display, g_wl.queue);
 
     // Register close callback -- intercepts xdg_toplevel close before mpv sees it
@@ -927,6 +1030,11 @@ static void wl_cleanup() {
     clipboard_wayland::cleanup();
     // Input layer owns seat/pointer/keyboard/xkb/cursor-shape-device.
     input::wayland::cleanup();
+    // Popup
+    if (g_wl.popup_viewport) wp_viewport_destroy(g_wl.popup_viewport);
+    if (g_wl.popup_buffer) wl_buffer_destroy(g_wl.popup_buffer);
+    if (g_wl.popup_subsurface) wl_subsurface_destroy(g_wl.popup_subsurface);
+    if (g_wl.popup_surface) wl_surface_destroy(g_wl.popup_surface);
     // Overlay
     if (g_wl.overlay_alpha) { wp_alpha_modifier_surface_v1_destroy(g_wl.overlay_alpha); g_wl.overlay_alpha = nullptr; }
     if (g_wl.overlay_viewport) wp_viewport_destroy(g_wl.overlay_viewport);
@@ -1322,6 +1430,7 @@ static void wl_set_titlebar_color(uint8_t, uint8_t, uint8_t) {}
 
 Platform make_wayland_platform() {
     return Platform{
+        .display = DisplayBackend::Wayland,
         .early_init = []() {},
         .init = wl_init,
         .cleanup = wl_cleanup,
@@ -1332,6 +1441,10 @@ Platform make_wayland_platform() {
         .overlay_present_software = wl_overlay_present_software,
         .overlay_resize = wl_overlay_resize,
         .set_overlay_visible = wl_set_overlay_visible,
+        .popup_show = wl_popup_show,
+        .popup_hide = wl_popup_hide,
+        .popup_present = wl_popup_present,
+        .popup_present_software = wl_popup_present_software,
         .fade_overlay = wl_fade_overlay,
         .set_fullscreen = wl_set_fullscreen,
         .toggle_fullscreen = wl_toggle_fullscreen,
@@ -1348,5 +1461,6 @@ Platform make_wayland_platform() {
         .set_idle_inhibit = wl_set_idle_inhibit,
         .set_titlebar_color = wl_set_titlebar_color,
         .clipboard_read_text_async = clipboard_wayland::read_text_async,
+        .open_external_url = open_url_linux::open,
     };
 }

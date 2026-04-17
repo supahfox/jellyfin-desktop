@@ -133,6 +133,8 @@ bool WebBrowser::handleMessage(const std::string& name,
         g_mpv.SetAudioTrack(getIntArg(args, 0));
     } else if (name == "playerSetAudioDelay") {
         g_mpv.SetAudioDelay(args->GetDouble(0));
+    } else if (name == "playerSetAspectMode") {
+        g_mpv.SetAspectMode(args->GetString(0).ToString());
     } else if (name == "playerOsdActive") {
         bool active = args->GetBool(0);
         if (active) {
@@ -154,6 +156,7 @@ bool WebBrowser::handleMessage(const std::string& name,
         applySettingValue(section, key, value);
     } else if (name == "themeColor") {
         std::string color = args->GetString(0).ToString();
+        LOG_DEBUG(LOG_CEF, "themeColor IPC: {}", color.c_str());
         if (g_titlebar_color) g_titlebar_color->onThemeColor(color);
     } else if (name == "notifyMetadata") {
         std::string json = args->GetString(0).ToString();

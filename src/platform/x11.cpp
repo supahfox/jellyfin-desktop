@@ -4,6 +4,7 @@
 #include "browser/web_browser.h"
 #include "browser/overlay_browser.h"
 #include "idle_inhibit_linux.h"
+#include "open_url_linux.h"
 #include "input/input_x11.h"
 
 #include <xcb/xcb.h>
@@ -360,7 +361,7 @@ static void x11_set_overlay_visible(bool visible) {
 // Fade overlay
 // =====================================================================
 
-static void x11_fade_overlay(float delay_sec, float fade_sec,
+static void x11_fade_overlay(float fade_sec,
                              std::function<void()> on_fade_start,
                              std::function<void()> on_complete) {
     if (g_x11.net_wm_opacity == XCB_NONE) {
@@ -371,11 +372,9 @@ static void x11_fade_overlay(float delay_sec, float fade_sec,
         return;
     }
 
-    std::thread([delay_sec, fade_sec,
+    std::thread([fade_sec,
                  on_fade_start = std::move(on_fade_start),
                  on_complete = std::move(on_complete)]() {
-        if (delay_sec > 0)
-            std::this_thread::sleep_for(std::chrono::duration<float>(delay_sec));
         if (on_fade_start) on_fade_start();
 
         int fps = g_display_hz.load(std::memory_order_relaxed);
@@ -617,6 +616,7 @@ static void x11_cleanup() {
 
 Platform make_x11_platform() {
     return Platform{
+        .display = DisplayBackend::X11,
         .early_init = []() {},
         .init = x11_init,
         .cleanup = x11_cleanup,
@@ -627,6 +627,10 @@ Platform make_x11_platform() {
         .overlay_present_software = x11_overlay_present_software,
         .overlay_resize = x11_overlay_resize,
         .set_overlay_visible = x11_set_overlay_visible,
+        .popup_show = [](int, int, int, int) {},
+        .popup_hide = []() {},
+        .popup_present = [](const CefAcceleratedPaintInfo&, int, int) {},
+        .popup_present_software = [](const void*, int, int, int, int) {},
         .fade_overlay = x11_fade_overlay,
         .set_fullscreen = x11_set_fullscreen,
         .toggle_fullscreen = x11_toggle_fullscreen,
@@ -656,5 +660,6 @@ Platform make_x11_platform() {
         .set_titlebar_color = [](uint8_t, uint8_t, uint8_t) {},
         .shared_texture_supported = false,
         .clipboard_read_text_async = nullptr,
+        .open_external_url = open_url_linux::open,
     };
 }

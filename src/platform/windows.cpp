@@ -19,6 +19,7 @@
 #include <dxgi1_2.h>
 #include <dcomp.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 
 #include <mutex>
 #include <thread>
@@ -28,6 +29,7 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dcomp.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "shell32.lib")
 
 // =====================================================================
 // Windows state (file-static)
@@ -327,9 +329,9 @@ static void win_set_overlay_visible(bool visible) {
     }
 }
 
-// Wait delay_sec, then animate overlay opacity from 1.0 to 0.0 over fade_sec,
-// then hide.  Runs on a detached thread -- finite UI animation.
-static void win_fade_overlay(float delay_sec, float fade_sec,
+// Animate overlay opacity from 1.0 to 0.0 over fade_sec, then hide.
+// Runs on a detached thread -- finite UI animation.
+static void win_fade_overlay(float fade_sec,
                              std::function<void()> on_fade_start,
                              std::function<void()> on_complete) {
     if (!g_win.dcomp_overlay_visual) {
@@ -339,11 +341,9 @@ static void win_fade_overlay(float delay_sec, float fade_sec,
         return;
     }
 
-    std::thread([delay_sec, fade_sec,
+    std::thread([fade_sec,
                  on_fade_start = std::move(on_fade_start),
                  on_complete = std::move(on_complete)]() {
-        if (delay_sec > 0)
-            std::this_thread::sleep_for(std::chrono::duration<float>(delay_sec));
         if (on_fade_start) on_fade_start();
 
         int fps = g_display_hz.load(std::memory_order_relaxed);
@@ -674,6 +674,17 @@ static void win_clipboard_read_text_async(std::function<void(std::string)> on_do
     on_done(std::move(result));
 }
 
+static void win_open_external_url(const std::string& url) {
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, url.data(), (int)url.size(), nullptr, 0);
+    if (wlen <= 0) return;
+    std::wstring wurl(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, url.data(), (int)url.size(), wurl.data(), wlen);
+    HINSTANCE r = ShellExecuteW(nullptr, L"open", wurl.c_str(),
+                                nullptr, nullptr, SW_SHOWNORMAL);
+    if ((INT_PTR)r <= 32)
+        LOG_ERROR(LOG_PLATFORM, "ShellExecuteW failed ({}): {}", (INT_PTR)r, url);
+}
+
 // Query window position relative to the monitor's working area (excludes
 // taskbar), in physical pixels. Matches mpv's --geometry +X+Y coordinate
 // system on Windows (vo_calc_window_geometry uses the working area).
@@ -711,6 +722,7 @@ static void win_clamp_window_geometry(int* w, int* h, int* x, int* y) {
 
 Platform make_windows_platform() {
     return Platform{
+        .display = DisplayBackend::Windows,
         .early_init = win_early_init,
         .init = win_init,
         .cleanup = win_cleanup,
@@ -721,6 +733,10 @@ Platform make_windows_platform() {
         .overlay_present_software = win_overlay_present_software,
         .overlay_resize = win_overlay_resize,
         .set_overlay_visible = win_set_overlay_visible,
+        .popup_show = [](int, int, int, int) {},
+        .popup_hide = []() {},
+        .popup_present = [](const CefAcceleratedPaintInfo&, int, int) {},
+        .popup_present_software = [](const void*, int, int, int, int) {},
         .fade_overlay = win_fade_overlay,
         .set_fullscreen = win_set_fullscreen,
         .toggle_fullscreen = win_toggle_fullscreen,
@@ -737,6 +753,7 @@ Platform make_windows_platform() {
         .set_idle_inhibit = win_set_idle_inhibit,
         .set_titlebar_color = win_set_titlebar_color,
         .clipboard_read_text_async = win_clipboard_read_text_async,
+        .open_external_url = win_open_external_url,
     };
 }
 

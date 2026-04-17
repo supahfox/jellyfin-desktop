@@ -342,8 +342,8 @@ void App::OnContextCreated(CefRefPtr<CefBrowser> browser,
         "playerLoad", "playerStop", "playerPause", "playerPlay", "playerSeek",
         "playerSetVolume", "playerSetMuted", "playerSetSpeed",
         "playerSetSubtitle", "playerAddSubtitle", "playerSetAudio",
-        "playerSetAudioDelay", "playerOsdActive",
-        "saveServerUrl", "loadServer", "checkServerConnectivity",
+        "playerSetAudioDelay", "playerSetAspectMode", "playerOsdActive",
+        "saveServerUrl", "navigateMain", "dismissOverlay", "checkServerConnectivity", "cancelServerConnectivity",
         "notifyMetadata", "notifyPosition", "notifySeek",
         "notifyPlaybackState", "notifyArtwork", "notifyQueueChange",
         "notifyRateChange",
@@ -377,6 +377,8 @@ void App::OnContextCreated(CefRefPtr<CefBrowser> browser,
     shim_str += embedded_js.at("mpv-audio-player.js");
     shim_str += '\n';
     shim_str += embedded_js.at("input-plugin.js");
+    shim_str += '\n';
+    shim_str += embedded_js.at("client-settings.js");
     shim_str += '\n';
     shim_str += embedded_js.at("context-menu.js");
     frame->ExecuteJavaScript(shim_str, frame->GetURL(), 0);

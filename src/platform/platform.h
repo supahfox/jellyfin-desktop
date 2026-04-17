@@ -8,7 +8,11 @@
 
 enum class IdleInhibitLevel { None, System, Display };
 
+#include "display_backend.h"
+
 struct Platform {
+    DisplayBackend display{};
+
     void (*early_init)();
     bool (*init)(mpv_handle* mpv);
     void (*cleanup)();
@@ -25,10 +29,16 @@ struct Platform {
                                      const void* buffer, int w, int h);
     void (*overlay_resize)(int lw, int lh, int pw, int ph);
     void (*set_overlay_visible)(bool visible);
-    // Delay, then fade overlay from opaque to transparent, then hide.
-    // on_fade_start is called after the delay, just before the fade begins.
-    // on_complete is called after the fade finishes.  Both may fire on any thread.
-    void (*fade_overlay)(float delay_sec, float fade_sec,
+
+    // Popup subsurface (CEF OSR popup elements, e.g. <select> dropdowns)
+    void (*popup_show)(int x, int y, int lw, int lh);
+    void (*popup_hide)();
+    void (*popup_present)(const CefAcceleratedPaintInfo& info, int lw, int lh);
+    void (*popup_present_software)(const void* buffer, int pw, int ph, int lw, int lh);
+    // Fade overlay from opaque to transparent over `fade_sec`, then hide.
+    // on_fade_start fires just before the fade begins; on_complete fires after
+    // the fade finishes. Both may fire on any thread.
+    void (*fade_overlay)(float fade_sec,
                          std::function<void()> on_fade_start,
                          std::function<void()> on_complete);
 
@@ -86,7 +96,7 @@ struct Platform {
     // must be non-null.
     bool shared_texture_supported = true;
 
-    // CEF ozone platform. Resolved once in main() from use_wayland / --ozone-platform.
+    // CEF ozone platform. Resolved once in main() from display backend / --ozone-platform.
     // The dmabuf probe tests GL on this display.
     std::string cef_ozone_platform;
 
@@ -102,8 +112,12 @@ struct Platform {
     // macOS/Windows the OS API is synchronous and the callback runs inline
     // on the calling thread. Callbacks may run on any thread.
     void (*clipboard_read_text_async)(std::function<void(std::string)> on_done);
+
+    // Caller guarantees non-empty URL not starting with '-'.
+    void (*open_external_url)(const std::string& url);
 };
 
+// Internal platform factories — called by make_platform()
 #ifdef _WIN32
 Platform make_windows_platform();
 #elif defined(__APPLE__)
@@ -114,3 +128,24 @@ Platform make_wayland_platform();
 Platform make_x11_platform();
 #endif
 #endif
+
+inline Platform make_platform(DisplayBackend backend) {
+    Platform p;
+#ifdef _WIN32
+    (void)backend;
+    p = make_windows_platform();
+#elif defined(__APPLE__)
+    (void)backend;
+    p = make_macos_platform();
+#else
+    switch (backend) {
+    case DisplayBackend::Wayland: p = make_wayland_platform(); break;
+#ifdef HAVE_X11
+    case DisplayBackend::X11: p = make_x11_platform(); break;
+#endif
+    default: __builtin_unreachable();
+    }
+#endif
+    p.early_init();
+    return p;
+}
