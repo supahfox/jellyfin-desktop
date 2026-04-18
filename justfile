@@ -38,6 +38,10 @@ test: build
 run: build
     build/jellyfin-desktop --log-level=debug --log-file=build/run.log
 
+# Update vendored/fetched deps (CEF, doctest, quill); pass --check to verify only
+update-deps *args:
+    python3 dev/tools/update_deps.py {{args}}
+
 # Remove build artifacts (keeps CEF SDK download)
 clean:
     rm -rf build third_party/mpv/build
