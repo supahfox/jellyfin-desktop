@@ -66,6 +66,7 @@ static void applySettingValue(const std::string& section, const std::string& key
     else if (key == "titlebarThemeColor") s.setTitlebarThemeColor(value == "true");
     else if (key == "logLevel") s.setLogLevel(value);
     else if (key == "forceTranscoding") s.setForceTranscoding(value == "true");
+    else if (key == "deviceName") s.setDeviceName(value);
     else LOG_WARN(LOG_CEF, "Unknown setting key: {}.{}", section.c_str(), key.c_str());
     s.saveAsync();
 }
@@ -252,7 +253,7 @@ bool WebBrowser::handleMessage(const std::string& name,
     } else if (name == "appExit") {
         initiate_shutdown();
     } else if (name == "openConfigDir") {
-        LOG_INFO(LOG_CEF, "Openning mpv home directory");
+        LOG_INFO(LOG_CEF, "Opening mpv home directory");
         paths::openMpvHome();
     } else {
         return false;
