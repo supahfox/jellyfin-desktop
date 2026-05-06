@@ -372,11 +372,9 @@ int main(int argc, char* argv[]) {
     std::string audio_passthrough_str;
     bool audio_exclusive = false;
     std::string audio_channels_str;
-    bool player_mode = false;
     bool disable_gpu_compositing = false;
     std::string ozone_platform;
     std::string platform_override;
-    std::vector<std::string> player_playlist;
     int remote_debugging_port = 0;
     const char* log_level_str = nullptr;
     const char* log_file_path = nullptr;
@@ -393,7 +391,6 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             printf("Usage: jellyfin-desktop [options]\n"
-                   "       jellyfin-desktop --player [options] <file|url>...\n"
                    "\nOptions:\n"
                    "  -h, --help                Show this help\n"
                    "  -v, --version             Show version\n"
@@ -409,11 +406,22 @@ int main(int argc, char* argv[]) {
 #ifdef HAVE_X11
                    "  --platform <wayland|x11>  Force display backend (Linux only)\n"
 #endif
-                   "  --player                  Standalone player mode\n",
+                   ,
                    kDefaultLogLevelName, kHwdecDefault);
             return 0;
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
-            printf("jellyfin-desktop %s\nCEF %s\n", APP_VERSION_STRING, CEF_VERSION);
+            printf("jellyfin-desktop %s\n\nCEF %s\n\n", APP_VERSION_STRING, CEF_VERSION);
+            mpv_handle* h = mpv_create();
+            if (h && mpv_initialize(h) >= 0) {
+                for (const char* prop : {"mpv-version", "ffmpeg-version"}) {
+                    char* v = mpv_get_property_string(h, prop);
+                    if (v) {
+                        printf("%s %s\n", prop, v);
+                        mpv_free(v);
+                    }
+                }
+            }
+            if (h) mpv_terminate_destroy(h);
             return 0;
         } else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
             log_level_str = argv[++i];
@@ -451,10 +459,9 @@ int main(int argc, char* argv[]) {
             platform_override = argv[++i];
         } else if (strncmp(argv[i], "--platform=", 11) == 0) {
             platform_override = argv[i] + 11;
-        } else if (strcmp(argv[i], "--player") == 0) {
-            player_mode = true;
-        } else if (argv[i][0] != '-') {
-            player_playlist.push_back(argv[i]);
+        } else {
+            fprintf(stderr, "Error: unknown argument '%s'\n", argv[i]);
+            return 1;
         }
     }
 
@@ -482,11 +489,6 @@ int main(int argc, char* argv[]) {
         }
     }
     initLogging(log_path.c_str(), log_level);
-
-    if (player_mode && player_playlist.empty()) {
-        fprintf(stderr, "Error: --player requires at least one file or URL\n");
-        return 1;
-    }
 
     LOG_INFO(LOG_MAIN, "jellyfin-desktop " APP_VERSION_STRING);
     LOG_INFO(LOG_MAIN, "CEF {}", CEF_VERSION);
@@ -632,11 +634,6 @@ int main(int argc, char* argv[]) {
     g_mpv.SetWakeupCallback([](void*) {}, nullptr);
     observe_properties(g_mpv);
 
-    // Load file if in player mode (before init so it's in the playlist)
-    if (player_mode) {
-        g_mpv.LoadFile(player_playlist[0], {});
-    }
-
     int init_err = g_mpv.Initialize();
     if (init_err < 0) {
         LOG_ERROR(LOG_MAIN, "mpv_initialize failed: {}", init_err);
@@ -644,6 +641,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     g_mpv.SetLogLevel(log_level);
+
+    for (const char* prop : {"mpv-version", "ffmpeg-version"}) {
+        char* v = mpv_get_property_string(g_mpv, prop);
+        if (v) {
+            LOG_INFO(LOG_MAIN, "{} {}", prop, v);
+            mpv_free(v);
+        }
+    }
 
     // input-default-bindings=no removes all builtin bindings including
     // CLOSE_WIN → quit.  Re-bind it so the WM close button works.
@@ -829,17 +834,7 @@ int main(int argc, char* argv[]) {
     std::string server_url = Settings::instance().serverUrl();
     std::string main_url;
 
-    if (player_mode) {
-        // Build player URL with playlist
-        auto list = CefListValue::Create();
-        for (size_t i = 0; i < player_playlist.size(); i++)
-            list->SetString(i, player_playlist[i]);
-        auto val = CefValue::Create();
-        val->SetList(list);
-        auto json = CefWriteJSON(val, JSON_WRITER_DEFAULT);
-        auto encoded = CefURIEncode(json, false);
-        main_url = "app://resources/player.html#" + encoded.ToString();
-    } else if (!server_url.empty()) {
+    if (!server_url.empty()) {
         // Eager pre-load: begin fetching the saved server while the overlay
         // probes in parallel. The overlay fades out on success, revealing the
         // already-loaded page.
@@ -852,8 +847,8 @@ int main(int argc, char* argv[]) {
     g_web_browser->create(wi, bs, main_url);
     LOG_INFO(LOG_MAIN, "[FLOW] CreateBrowser(main) call returned");
 
-    // Overlay browser (server selection UI) -- only in full app mode
-    if (!player_mode) {
+    // Overlay browser (server selection UI)
+    {
         RenderTarget overlay_target{g_platform.overlay_present, g_platform.overlay_present_software};
         g_overlay_browser = new OverlayBrowser(overlay_target, *g_web_browser,
                                                lw, lh, (int)mw, (int)mh);
