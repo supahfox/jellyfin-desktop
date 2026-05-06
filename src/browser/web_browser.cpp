@@ -87,7 +87,7 @@ CefRefPtr<CefDictionaryValue> WebBrowser::injectionProfile() {
         "playerLoad", "playerStop", "playerPause", "playerPlay", "playerSeek",
         "playerSetVolume", "playerSetMuted", "playerSetSpeed",
         "playerSetSubtitle", "playerAddSubtitle", "playerSetAudio", "playerAddAudio",
-        "playerSetAudioDelay", "playerSetAspectMode", "playerOsdActive",
+        "playerSetAudioDelay", "playerSetSubtitleDelay", "playerSetAspectMode", "playerOsdActive",
         "openConfigDir", "saveServerUrl",
         "notifyMetadata", "notifyPosition", "notifySeek",
         "notifyPlaybackState", "notifyArtwork", "notifyQueueChange",
@@ -147,23 +147,27 @@ bool WebBrowser::handleMessage(const std::string& name,
     if (name == "playerLoad") {
         std::string url = args->GetString(0).ToString();
         int startMs = args->GetSize() > 1 ? getIntArg(args, 1) : 0;
-        int audioIdx = getIntArg(args, 2);
-        int subIdx = getIntArg(args, 3);
-        // arg 4 is metadataJson (consumed elsewhere); args 5 and 6 are
+        int videoIdx = getIntArg(args, 2);
+        int audioIdx = getIntArg(args, 3);
+        int subIdx = getIntArg(args, 4);
+        // arg 5 is metadataJson (consumed elsewhere); args 6 and 7 are
         // optional external audio / subtitle URLs bundled into load so
         // their audio-add / sub-add can be queued before the FILE_LOADED-
         // driven unpause, gating playback on each external file being
         // opened and its track selected.
-        std::string externalAudioUrl = args->GetSize() > 5 ? args->GetString(5).ToString() : "";
-        std::string externalSubUrl = args->GetSize() > 6 ? args->GetString(6).ToString() : "";
-        LOG_INFO(LOG_CEF, "playerLoad: audio={} sub={} start={}ms extAudio={} extSub={} url={}",
-                 audioIdx, subIdx, startMs, externalAudioUrl.c_str(), externalSubUrl.c_str(), url.c_str());
+        std::string externalAudioUrl = args->GetSize() > 6 ? args->GetString(6).ToString() : "";
+        std::string externalSubUrl = args->GetSize() > 7 ? args->GetString(7).ToString() : "";
+        bool isInfiniteStream = args->GetSize() > 8 ? args->GetBool(8) : false;
+        LOG_INFO(LOG_CEF, "playerLoad: video={} audio={} sub={} start={}ms infinite={} extAudio={} extSub={} url={}",
+                 videoIdx, audioIdx, subIdx, startMs, isInfiniteStream, externalAudioUrl.c_str(), externalSubUrl.c_str(), url.c_str());
         MpvHandle::LoadOptions opts;
         opts.startSecs = startMs / 1000.0;
+        opts.videoTrack = videoIdx;
         opts.audioTrack = audioIdx;
         opts.subTrack = subIdx;
         opts.externalAudioUrl = externalAudioUrl;
         opts.externalSubUrl = externalSubUrl;
+        opts.isInfiniteStream = isInfiniteStream;
         g_mpv.LoadFile(url, opts);
     } else if (name == "playerStop") {
         g_mpv.Stop();
@@ -195,6 +199,8 @@ bool WebBrowser::handleMessage(const std::string& name,
         g_mpv.AudioAdd(url);
     } else if (name == "playerSetAudioDelay") {
         g_mpv.SetAudioDelay(args->GetDouble(0));
+    } else if (name == "playerSetSubtitleDelay") {
+        g_mpv.SetSubtitleDelay(args->GetDouble(0));
     } else if (name == "playerSetAspectMode") {
         g_mpv.SetAspectMode(args->GetString(0).ToString());
     } else if (name == "playerOsdActive") {
