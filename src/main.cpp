@@ -15,7 +15,6 @@
 #include "browser/browsers.h"
 #include "browser/web_browser.h"
 #include "browser/overlay_browser.h"
-#include "browser/about_browser.h"
 #include "mpv/event.h"
 #include "mpv/options.h"
 #include "mpv/capabilities.h"
@@ -75,7 +74,7 @@ ThemeColor* g_theme_color = nullptr;
 
 Platform g_platform{};
 WebBrowser* g_web_browser = nullptr;
-OverlayBrowser* g_overlay_browser = nullptr;
+// g_browsers is defined in src/browser/browsers.cpp.
 
 static void log_mpv_message(const mpv_event_log_message* msg) {
     switch (msg->log_level) {
@@ -143,9 +142,6 @@ static void mpv_digest_thread() {
             if (me.type == MpvEventType::NONE) continue;
             if (me.type == MpvEventType::OSD_DIMS) {
                 if (me.lw <= 0 || me.lh <= 0) continue;
-                if (g_platform.in_transition())
-                    g_platform.set_expected_size(me.pw, me.ph);
-                g_platform.resize(me.lw, me.lh, me.pw, me.ph);
             }
             if (me.type == MpvEventType::FULLSCREEN) {
                 g_platform.set_fullscreen(me.flag);
@@ -261,20 +257,6 @@ static int run_with_cef(int mw, int mh,
     int lw = static_cast<int>(mw / scale);
     int lh = static_cast<int>(mh / scale);
 
-    CefWindowInfo wi;
-    wi.SetAsWindowless(0);
-    wi.shared_texture_enabled = use_shared_textures;
-#ifdef __APPLE__
-    // Drive BeginFrames from CVDisplayLink (platform/macos.mm:g_display_link)
-    // to eliminate phase lag against CEF's internal 60Hz timer.
-    wi.external_begin_frame_enabled = true;
-#else
-    wi.external_begin_frame_enabled = false;
-#endif
-    CefBrowserSettings bs;
-    bs.background_color = 0;
-    CefLayer::setRefreshRate(bs, mpv::display_hz());
-
     // Must exist before main browser creation: the pre-loaded page fires
     // its initial theme-color IPC at DOMContentLoaded; onOverlayDismissed
     // needs a color already captured.
@@ -285,10 +267,12 @@ static int run_with_cef(int mw, int mh,
     });
     g_theme_color = &theme_color_obj;
 
-    RenderTarget main_target{g_platform.present, g_platform.present_software};
-    auto web_browser_owner = std::make_unique<WebBrowser>(main_target, lw, lh, mw, mh);
+    Browsers browsers(lw, lh, mw, mh, mpv::display_hz(), use_shared_textures);
+    g_browsers = &browsers;
+
+    auto main_layer = browsers.create(WebBrowser::injectionProfile());
+    auto web_browser_owner = std::make_unique<WebBrowser>(main_layer);
     g_web_browser = web_browser_owner.get();
-    g_platform.resize(lw, lh, mw, mh);
 
     std::string server_url = Settings::instance().serverUrl();
     std::string main_url;
@@ -299,31 +283,17 @@ static int run_with_cef(int mw, int mh,
 
     LOG_INFO(LOG_MAIN, "[FLOW] CreateBrowser(main) url={} lw={} lh={} pw={} ph={}",
              main_url.c_str(), lw, lh, mw, mh);
-    g_web_browser->create(wi, bs, main_url);
+    main_layer->create(main_url);
     LOG_INFO(LOG_MAIN, "[FLOW] CreateBrowser(main) call returned");
 
     std::unique_ptr<OverlayBrowser> overlay_browser_owner;
     {
-        RenderTarget overlay_target{g_platform.overlay_present, g_platform.overlay_present_software};
+        auto overlay_layer = browsers.create(OverlayBrowser::injectionProfile());
+        overlay_layer->setVisible(true);
         overlay_browser_owner = std::make_unique<OverlayBrowser>(
-            overlay_target, *g_web_browser, lw, lh, mw, mh);
-        g_overlay_browser = overlay_browser_owner.get();
-        g_platform.set_overlay_visible(true);
-
-        CefWindowInfo owi;
-        owi.SetAsWindowless(0);
-        owi.shared_texture_enabled = use_shared_textures;
-#ifdef __APPLE__
-        owi.external_begin_frame_enabled = true;
-#else
-        owi.external_begin_frame_enabled = false;
-#endif
-        CefBrowserSettings obs;
-        obs.background_color = 0;
-        CefLayer::setRefreshRate(obs, mpv::display_hz());
+            overlay_layer, *g_web_browser);
         LOG_INFO(LOG_MAIN, "[FLOW] CreateBrowser(overlay)");
-        CefBrowserHost::CreateBrowser(owi, g_overlay_browser->client(), "app://resources/overlay.html", obs,
-                                      OverlayBrowser::injectionProfile(), nullptr);
+        overlay_layer->create("app://resources/overlay.html");
         LOG_INFO(LOG_MAIN, "[FLOW] CreateBrowser(overlay) call returned");
     }
 
@@ -378,16 +348,12 @@ static int run_with_cef(int mw, int mh,
 
     // CEF may still have browser-close work in flight after the main loop
     // breaks. Spin the runloop event-driven until all browsers report closed.
-    while (!g_web_browser->isClosed() ||
-           (g_overlay_browser && !g_overlay_browser->isClosed()) ||
-           (g_about_browser && !g_about_browser->isClosed())) {
+    while (g_browsers && !g_browsers->allClosed()) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 60.0, true);
     }
 
 #else
-    g_web_browser->waitForClose();
-    if (g_overlay_browser)
-        g_overlay_browser->waitForClose();
+    if (g_browsers) g_browsers->waitAllClosed();
 #endif
 
     g_theme_color = nullptr;
@@ -455,15 +421,17 @@ static int run_with_cef(int mw, int mh,
         Settings::instance().save();
     }
 
-    // Browsers must be deleted before CefShutdown (waitForClose above
-    // guarantees they're closed at the CEF level).
+    // Business owners released first — their dtors call g_browsers->remove,
+    // freeing the platform surfaces and clearing the active pointer. About
+    // is a self-managed singleton: its BeforeCloseCallback already deleted
+    // it during the close drain above. Any straggler surface gets freed by
+    // Browsers' dtor when `browsers` goes out of scope.
     g_web_browser = nullptr;
     web_browser_owner.reset();
-    g_overlay_browser = nullptr;
     overlay_browser_owner.reset();
-    // g_about_browser self-deletes via BeforeCloseCallback; cover the
-    // shutdown race where we got here before the callback ran.
-    if (g_about_browser) { delete g_about_browser; g_about_browser = nullptr; }
+    g_browsers = nullptr;
+    // `browsers` itself goes out of scope here; any straggler surfaces
+    // get freed by its dtor.
 
     return 0;
 }

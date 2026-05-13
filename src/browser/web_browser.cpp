@@ -95,7 +95,6 @@ CefRefPtr<CefDictionaryValue> WebBrowser::injectionProfile() {
         "notifyRateChange",
         "appExit", "setSettingValue", "themeColor",
         "setOsdVisible", "setCursorVisible", "toggleFullscreen",
-        "menuItemSelected", "menuDismissed",
     };
     static const char* const kScripts[] = {
         "native-shim.js",
@@ -104,7 +103,6 @@ CefRefPtr<CefDictionaryValue> WebBrowser::injectionProfile() {
         "mpv-audio-player.js",
         "input-plugin.js",
         "client-settings.js",
-        "context-menu.js",
     };
 
     CefRefPtr<CefListValue> fns = CefListValue::Create();
@@ -123,21 +121,27 @@ CefRefPtr<CefDictionaryValue> WebBrowser::injectionProfile() {
     return d;
 }
 
-WebBrowser::WebBrowser(RenderTarget target, int w, int h, int pw, int ph)
-    : client_(new CefLayer(target, w, h, pw, ph))
+WebBrowser::WebBrowser(CefRefPtr<CefLayer> layer)
+    : layer_(std::move(layer))
 {
-    client_->setMessageHandler([this](const std::string& name,
-                                      CefRefPtr<CefListValue> args,
-                                      CefRefPtr<CefBrowser> browser) {
+    layer_->setName("web");
+    layer_->setMessageHandler([this](const std::string& name,
+                                     CefRefPtr<CefListValue> args,
+                                     CefRefPtr<CefBrowser> browser) {
         return handleMessage(name, args, browser);
     });
-    client_->setCreatedCallback([](CefRefPtr<CefBrowser> browser) {
-        // Main browser takes input only if the overlay isn't currently active.
-        if (!g_overlay_browser)
-            input::set_active_browser(browser);
+    layer_->setCreatedCallback([](CefRefPtr<CefBrowser> browser) {
+        // Main browser takes input only if no other layer has already
+        // claimed it (e.g. the server-selection overlay).
+        if (g_browsers && !g_browsers->active())
+            g_browsers->setActive(browser);
     });
-    client_->setContextMenuBuilder(&app_menu::build);
-    client_->setContextMenuDispatcher(&app_menu::dispatch);
+    layer_->setContextMenuBuilder(&app_menu::build);
+    layer_->setContextMenuDispatcher(&app_menu::dispatch);
+}
+
+WebBrowser::~WebBrowser() {
+    release_layer(layer_.get());
 }
 
 bool WebBrowser::handleMessage(const std::string& name,

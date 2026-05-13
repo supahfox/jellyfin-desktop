@@ -407,6 +407,35 @@ void App::OnContextCreated(CefRefPtr<CefBrowser> browser,
     }
     window->SetValue("jmpNative", jmpNative, V8_PROPERTY_ATTRIBUTE_READONLY);
 
+    // After each window resize, keep producing compositor frames until
+    // CefLayer::noteStableSize detects 3 consecutive same-size paints
+    // and calls window.__cefStopRaf. No time deadline — relies entirely
+    // on the native stop signal.
+    frame->ExecuteJavaScript(
+        R"(
+            (function () {
+                var running = false;
+                var stop = false;
+                function tick() {
+                    if (stop) {
+                        stop = false;
+                        running = false;
+                        return;
+                    }
+                    requestAnimationFrame(tick);
+                }
+                window.addEventListener('resize', function () {
+                    stop = false;
+                    if (!running) {
+                        running = true;
+                        requestAnimationFrame(tick);
+                    }
+                });
+                window.__cefStopRaf = function () { stop = true; };
+            })();
+        )",
+        frame->GetURL(), 0);
+
     if (!scripts || scripts->GetSize() == 0) return;
 
     // Renderer process is separate from browser process; settings need to be
