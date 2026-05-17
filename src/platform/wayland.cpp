@@ -1,23 +1,20 @@
 #include "common.h"
 #include "cef/cef_client.h"
 #include "platform/platform.h"
+#include "platform/wayland.h"
+#include "platform/wayland_scale_probe.h"
 #include "clipboard/wayland.h"
 #include "idle_inhibit_linux.h"
 #include "open_url_linux.h"
 #include "input/input_wayland.h"
 #include "mpv/event.h"
+#include "wlproxy/wlproxy.h"
 
 #include <wayland-client.h>
 #include "linux-dmabuf-v1-client.h"
 #include "viewporter-client.h"
 #include "alpha-modifier-v1-client.h"
 #include "cursor-shape-v1-client.h"
-// Callback fields in mpv's vo_wayland_state -- set via wayland-state property.
-// Must match the struct layout in wayland_common.h.
-struct wl_configure_cb {
-    void (*fn)(void *data, int width, int height, bool fullscreen);
-    void *data;
-};
 #include <drm/drm_fourcc.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -95,7 +92,7 @@ struct WlState {
     wp_viewporter* viewporter = nullptr;
     wp_alpha_modifier_v1* alpha_modifier = nullptr;
 
-    float cached_scale = 1.0f;
+    float cached_scale = 0.0f;  // 0 = unknown; wl_get_scale falls back to 1.0
     bool was_fullscreen = false;
     // Resize transition state. transitioning gates non-paint paths
     // (resize, configure, fullscreen reject). Paint path uses a function-
@@ -723,6 +720,41 @@ static void on_mpv_configure(void*, int width, int height, bool fs) {
 }
 
 // =====================================================================
+// Proxy configure intercept
+// =====================================================================
+
+// Fires from the wl-proxy per-client thread for every xdg_toplevel.configure
+// from the compositor. Authoritative size source on Wayland: updates the
+// mpv::osd_pw/osd_ph atomics + posts to the playback coordinator, replacing
+// the osd-dimensions observation that the rest of the codebase used to
+// consume.
+//
+// Safe before wl_init runs — on_mpv_configure early-outs on empty
+// g_wl.stack, and mpv::set_osd_dims null-checks g_playback_coord.
+extern "C" {
+static void on_proxy_configure(int physical_w, int physical_h, int fullscreen) {
+    on_mpv_configure(nullptr, physical_w, physical_h, fullscreen != 0);
+    mpv::set_osd_dims(physical_w, physical_h);
+}
+static void on_proxy_scale(int scale_120) {
+    if (scale_120 > 0)
+        g_wl.cached_scale = scale_120 / 120.0f;
+}
+}
+
+namespace platform::wayland {
+bool scale_known() { return g_wl.cached_scale > 0.f; }
+void register_proxy_callbacks() {
+    // Both callbacks register BEFORE mpv_create so the first compositor
+    // configure + preferred_scale events are caught. Otherwise registering
+    // them in wl_init misses the initial values — main.cpp computes initial
+    // logical dims using g_wl.cached_scale (still 1.0) and CEF overshoots.
+    jfn_wlproxy_set_configure_callback(on_proxy_configure);
+    jfn_wlproxy_set_scale_callback(on_proxy_scale);
+}
+}
+
+// =====================================================================
 // Platform interface
 // =====================================================================
 
@@ -1011,25 +1043,14 @@ static bool wl_init(mpv_handle* mpv) {
     // fullscreen property-change event, so s_fullscreen is up to date.
     g_wl.was_fullscreen = mpv::fullscreen();
 
-    // Register mpv configure callback early — mpv's VO thread is already
-    // processing configures in parallel, and we need to catch them all.
-    // on_mpv_configure is safe before surfaces exist (null checks throughout).
-    {
-        intptr_t cb_ptr = 0;
-        g_mpv.GetWaylandConfigureCbPtr(cb_ptr);
-        if (cb_ptr) {
-            auto* fn = reinterpret_cast<void(**)(void*, int, int, bool)>(cb_ptr);
-            auto* data = reinterpret_cast<void**>(cb_ptr + sizeof(void*));
-            *fn = [](void*, int w, int h, bool fs) { on_mpv_configure(nullptr, w, h, fs); };
-            *data = nullptr;
-        }
-    }
+    // Proxy configure + scale callbacks are wired by
+    // platform::wayland::register_proxy_callbacks before mpv_create.
 
     intptr_t dp = 0, sp = 0;
     g_mpv.GetWaylandDisplay(dp);
     g_mpv.GetWaylandSurface(sp);
     if (!dp || !sp) {
-        fprintf(stderr, "Failed to get Wayland display/surface from mpv\n");
+        LOG_ERROR(LOG_PLATFORM, "Failed to get Wayland display/surface from mpv");
         return false;
     }
 
@@ -1053,7 +1074,7 @@ static bool wl_init(mpv_handle* mpv) {
     wl_registry_destroy(reg);
 
     if (!g_wl.compositor || !g_wl.subcompositor) {
-        fprintf(stderr, "platform_wayland: missing compositor globals\n");
+        LOG_ERROR(LOG_PLATFORM, "platform_wayland: missing compositor globals");
         return false;
     }
 
@@ -1103,27 +1124,25 @@ static bool wl_init(mpv_handle* mpv) {
 }
 
 static float wl_get_scale() {
-    double scale = mpv::display_scale();
-    if (scale > 0) {
-        g_wl.cached_scale = static_cast<float>(scale);
-        return g_wl.cached_scale;
-    }
+    // g_wl.cached_scale is driven by jfn_wlproxy_set_scale_callback (registered
+    // in wl_init). Falls back to 1.0 before the compositor sends preferred_scale.
     return g_wl.cached_scale > 0 ? g_wl.cached_scale : 1.0f;
+}
+
+static float wl_get_display_scale(int x, int y) {
+    double s = wayland_scale_probe::query_scale(x, y);
+    return s > 0.0 ? static_cast<float>(s) : 1.0f;
 }
 
 static void wl_cleanup() {
     stop_fade_thread();
 
-    // Null the trampolines we installed into mpv's configure/close hooks
-    // before destroying the g_wl state they read. They keep being invoked
-    // until mpv itself is torn down, which happens after this function.
+    // Null the close trampoline we installed into mpv's hook before
+    // destroying the g_wl state it reads. It keeps being invoked until mpv
+    // itself is torn down, which happens after this function. (The configure
+    // hook is no longer used — proxy-side interception replaced it.)
     {
         intptr_t cb_ptr = 0;
-        g_mpv.GetWaylandConfigureCbPtr(cb_ptr);
-        if (cb_ptr) {
-            auto* fn = reinterpret_cast<void(**)(void*, int, int, bool)>(cb_ptr);
-            *fn = nullptr;
-        }
         g_mpv.GetWaylandCloseCbPtr(cb_ptr);
         if (cb_ptr) {
             auto* fn = reinterpret_cast<void(**)(void*)>(cb_ptr);
@@ -1230,16 +1249,14 @@ static void wl_end_transition_locked() {
 }
 
 static void wl_set_fullscreen(bool fullscreen) {
-    if (!g_mpv.IsValid()) return;
-    // Only transition if state actually changes. Read the cached value
-    // populated from mpv's fullscreen property observation — avoids a
-    // sync mpv_get_property from callers on the event thread.
-    if (mpv::fullscreen() == fullscreen) {
+    // Use g_wl.was_fullscreen (synced from xdg_toplevel.configure via
+    // on_mpv_configure) as the current state — no libmpv property involved.
+    if (g_wl.was_fullscreen == fullscreen) {
         // Compositor may have rejected our fullscreen change. If we're
         // mid-transition and the state matches the pre-toggle value
         // (was_fullscreen), the compositor forced us back — cancel.
         std::lock_guard<std::mutex> lock(g_wl.surface_mtx);
-        if (g_wl.transitioning && fullscreen == g_wl.was_fullscreen)
+        if (g_wl.transitioning)
             wl_end_transition_locked();
         return;
     }
@@ -1247,7 +1264,7 @@ static void wl_set_fullscreen(bool fullscreen) {
         std::lock_guard<std::mutex> lock(g_wl.surface_mtx);
         wl_begin_transition_locked();
     }
-    g_mpv.SetFullscreen(fullscreen);
+    jfn_wlproxy_set_fullscreen(fullscreen ? 1 : 0);
 }
 
 static void wl_toggle_fullscreen() {
@@ -1255,9 +1272,7 @@ static void wl_toggle_fullscreen() {
         std::lock_guard<std::mutex> lock(g_wl.surface_mtx);
         wl_begin_transition_locked();
     }
-    if (g_mpv.IsValid()) {
-        g_mpv.ToggleFullscreen();
-    }
+    jfn_wlproxy_set_fullscreen(g_wl.was_fullscreen ? 0 : 1);
 }
 
 static void wl_begin_transition() {
@@ -1558,6 +1573,7 @@ Platform make_wayland_platform() {
         .in_transition = wl_in_transition,
         .set_expected_size = wl_set_expected_size,
         .get_scale = wl_get_scale,
+        .get_display_scale = wl_get_display_scale,
         .query_window_position = [](int*, int*) -> bool { return false; },
         .clamp_window_geometry = nullptr,
         .pump = wl_pump,

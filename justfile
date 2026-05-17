@@ -15,3 +15,31 @@ update-deps *args:
 # Remove build artifacts
 clean:
     rm -rf build dist
+
+# Lint Rust crates (rustfmt --check + clippy -D warnings).
+# jfn-wlproxy is Linux-only and skipped on other platforms.
+lint:
+    #!/bin/sh
+    set -eu
+    cargo fmt --manifest-path src/config/Cargo.toml -- --check
+    cargo clippy --manifest-path src/config/Cargo.toml --all-targets -- -D warnings
+    cargo fmt --manifest-path src/cli/Cargo.toml -- --check
+    cargo clippy --manifest-path src/cli/Cargo.toml --all-targets -- -D warnings
+    cargo fmt --manifest-path src/jellyfin/Cargo.toml -- --check
+    cargo clippy --manifest-path src/jellyfin/Cargo.toml --all-targets -- -D warnings
+    cargo fmt --manifest-path src/log_redact/Cargo.toml -- --check
+    cargo clippy --manifest-path src/log_redact/Cargo.toml --all-targets -- -D warnings
+    cargo fmt --manifest-path src/paths/Cargo.toml -- --check
+    cargo clippy --manifest-path src/paths/Cargo.toml --all-targets -- -D warnings
+    cargo fmt --manifest-path src/wake_event/Cargo.toml -- --check
+    cargo clippy --manifest-path src/wake_event/Cargo.toml --all-targets -- -D warnings
+    cargo fmt --manifest-path src/single_instance/Cargo.toml -- --check
+    cargo clippy --manifest-path src/single_instance/Cargo.toml --all-targets -- -D warnings
+    if [ "$(uname)" != "MINGW64_NT" ] && [ "$(uname)" != "MSYS_NT" ]; then
+        cargo fmt --manifest-path src/signal_guard/Cargo.toml -- --check
+        cargo clippy --manifest-path src/signal_guard/Cargo.toml --all-targets -- -D warnings
+    fi
+    if [ "$(uname)" = "Linux" ]; then
+        cargo fmt --manifest-path src/wlproxy/Cargo.toml -- --check
+        cargo clippy --manifest-path src/wlproxy/Cargo.toml --all-targets -- -D warnings
+    fi

@@ -9,6 +9,7 @@
 //   Main thread: startup -> waitForClose -> cleanup
 
 #include "version.h"
+#include "cli.h"
 #include "common.h"
 #include "cef/cef_app.h"
 #include "cef/cef_client.h"
@@ -43,6 +44,11 @@
 #include <signal.h>
 #else
 #include "single_instance.h"
+#endif
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+#include "wlproxy/wlproxy.h"
+#include "platform/wayland.h"
 #endif
 
 #include "include/cef_version.h"
@@ -156,10 +162,9 @@ static void mpv_digest_thread() {
 //   browsers → CefShutdown → idle_inhibit clear → platform.cleanup
 // then main runs mpv terminate + post_window_cleanup.
 static int run_with_cef(int mw, int mh,
-                        std::string ozone_platform,
-                        bool disable_gpu_compositing,
-                        int remote_debugging_port,
+                        const cli::Args& args,
                         LogLevel log_level) {
+    std::string ozone_platform = args.ozone_platform;
 #if !defined(_WIN32) && !defined(__APPLE__)
     if (ozone_platform.empty())
         ozone_platform = g_platform.display == DisplayBackend::Wayland ? "wayland" : "x11";
@@ -188,10 +193,10 @@ static int run_with_cef(int mw, int mh,
             Settings::instance().forceTranscoding()));
     }
 
-    bool use_shared_textures = g_platform.shared_texture_supported && !disable_gpu_compositing;
+    bool use_shared_textures = g_platform.shared_texture_supported && !args.disable_gpu_compositing;
 
     CefRuntime::SetLogSeverity(toCefSeverity(log_level));
-    CefRuntime::SetRemoteDebuggingPort(remote_debugging_port);
+    CefRuntime::SetRemoteDebuggingPort(args.remote_debugging_port);
     CefRuntime::SetDisableGpuCompositing(!use_shared_textures);
 #ifdef __linux__
     if (!ozone_platform.empty())
@@ -215,38 +220,42 @@ static int run_with_cef(int mw, int mh,
     LOG_INFO(LOG_MAIN, "[FLOW] display-hidpi-scale={} fullscreen={} display-hz={}",
              display_hidpi_scale, fs_flag, mpv::display_hz());
 
-    // If the live display-hidpi-scale differs from the saved scale, the
-    // pixels we passed to --geometry were sized for the wrong scale.
-    // Resize using the saved logical × the live scale.
-    //
-    // When the compositor has forced fullscreen, still issue SetGeometry so
-    // mpv's stored unfullscreen size (wl->window_size) is scale-corrected for
-    // the eventual restore, but don't overwrite mw/mh — the fullscreen surface
-    // size is authoritative for browser creation.
+    // Scale-correct the window size when live display scale differs from
+    // saved. Skip while the compositor has the surface locked
+    // (fullscreen/maximized): mpv's wayland set_geometry runtime path
+    // unconditionally writes wl->window_size and fires VO_EVENT_RESIZE,
+    // which makes osd-dimensions emit the corrected size and CEF resize to
+    // it — while the actual surface stays at the locked size. Internal/
+    // visual size diverge ("sometimes" depending on whether the compositor
+    // re-issues a configure). Defer: the next clean unmaximize/unfullscreen
+    // restores to mpv's pre-init geometry value, the user resizes once, and
+    // shutdown saves a matching scale so subsequent launches need no
+    // correction.
     {
-        using WG = Settings::WindowGeometry;
         const auto& saved = Settings::instance().windowGeometry();
-        float saved_scale = saved.scale > 0.f ? saved.scale : WG::kDefaultScale;
-        int logical_w = saved.logical_width  > 0 ? saved.logical_width
-                                                 : WG::kDefaultLogicalWidth;
-        int logical_h = saved.logical_height > 0 ? saved.logical_height
-                                                 : WG::kDefaultLogicalHeight;
-        if (display_hidpi_scale > 0.0 &&
-            std::fabs(display_hidpi_scale - saved_scale) >= 0.01) {
+        bool locked = fs_flag || mpv::window_maximized();
+        // Only correct when we have a real saved scale that differs from
+        // live. Fresh-config (saved.scale == 0) was already computed at the
+        // live scale by the pre-init probe; re-issuing SetGeometry here
+        // takes mpv's runtime geometry path which bypasses configure_bounds.
+        if (!locked && display_hidpi_scale > 0.0 && saved.scale > 0.f &&
+            std::fabs(display_hidpi_scale - saved.scale) >= 0.01) {
             int new_pw = static_cast<int>(
-                std::lround(logical_w * display_hidpi_scale));
+                std::lround(saved.logical_width  * display_hidpi_scale));
             int new_ph = static_cast<int>(
-                std::lround(logical_h * display_hidpi_scale));
+                std::lround(saved.logical_height * display_hidpi_scale));
+            int dummy_x = -1, dummy_y = -1;
+            if (g_platform.clamp_window_geometry)
+                g_platform.clamp_window_geometry(&new_pw, &new_ph,
+                                                 &dummy_x, &dummy_y);
             std::string geom_str = std::to_string(new_pw) + "x"
                                  + std::to_string(new_ph);
             LOG_INFO(LOG_MAIN,
                      "[FLOW] scale {:.3f} -> {:.3f}, resize to {}",
-                     saved_scale, display_hidpi_scale, geom_str.c_str());
+                     saved.scale, display_hidpi_scale, geom_str.c_str());
             g_mpv.SetGeometry(geom_str);
-            if (!fs_flag) {
-                mw = new_pw;
-                mh = new_ph;
-            }
+            mw = new_pw;
+            mh = new_ph;
         }
         mpv::set_window_pixels(mw, mh);
     }
@@ -453,123 +462,50 @@ int main(int argc, char* argv[]) {
 
     if (int rc = CefRuntime::Start(argc, argv); rc >= 0) return rc;
 
-    std::string hwdec_str = kHwdecDefault;
-    std::string audio_passthrough_str;
-    bool audio_exclusive = false;
-    std::string audio_channels_str;
-    bool disable_gpu_compositing = false;
-    std::string ozone_platform;
-    std::string platform_override;
-    int remote_debugging_port = 0;
-    const char* log_level_str = nullptr;
-    const char* log_file_path = nullptr;
-
     Settings::instance().load();
-    auto& saved = Settings::instance();
-    if (!saved.hwdec().empty()) hwdec_str = saved.hwdec();
-    if (!saved.audioPassthrough().empty()) audio_passthrough_str = saved.audioPassthrough();
-    audio_exclusive = saved.audioExclusive();
-    if (!saved.audioChannels().empty()) audio_channels_str = saved.audioChannels();
-    std::string saved_log_level = saved.logLevel();
-    if (!saved_log_level.empty()) log_level_str = saved_log_level.c_str();
+    const auto& saved = Settings::instance();
+    cli::Args args;
+    args.hwdec = !saved.hwdec().empty() ? saved.hwdec() : std::string(kHwdecDefault);
+    args.audio_passthrough = saved.audioPassthrough();
+    args.audio_exclusive = saved.audioExclusive();
+    args.audio_channels = saved.audioChannels();
+    args.log_level = saved.logLevel();
 
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("Usage: jellyfin-desktop [options]\n"
-                   "\nOptions:\n"
-                   "  -h, --help                Show this help\n"
-                   "  -v, --version             Show version\n"
-                   "  --log-level <level>       trace|debug|info|warn|error (default: %s)\n"
-                   "  --log-file <path>         Write logs to file ('' to disable)\n"
-                   "  --hwdec <mode>            Hardware decoding mode (default: %s)\n"
-                   "  --audio-passthrough <codecs>  e.g. ac3,dts-hd,eac3,truehd\n"
-                   "  --audio-exclusive         Exclusive audio output\n"
-                   "  --audio-channels <layout> e.g. stereo, 5.1, 7.1\n"
-                   "  --remote-debug-port <port> Chrome remote debugging\n"
-                   "  --disable-gpu-compositing Disable CEF GPU compositing\n"
-                   "  --ozone-platform <plat>   CEF ozone platform (default: follows --platform)\n"
-#ifdef HAVE_X11
-                   "  --platform <wayland|x11>  Force display backend (Linux only)\n"
-#endif
-                   ,
-                   kDefaultLogLevelName, kHwdecDefault);
-            return 0;
-        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
-            printf("jellyfin-desktop %s\n\nCEF %s\n\n", APP_VERSION_FULL, CEF_VERSION);
-            mpv_handle* h = mpv_create();
-            if (h && mpv_initialize(h) >= 0) {
-                for (const char* prop : {"mpv-version", "ffmpeg-version"}) {
-                    char* v = mpv_get_property_string(h, prop);
-                    if (v) {
-                        printf("%s %s\n", prop, v);
-                        mpv_free(v);
-                    }
-                }
-            }
-            if (h) mpv_terminate_destroy(h);
-            return 0;
-        } else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
-            log_level_str = argv[++i];
-        } else if (strncmp(argv[i], "--log-level=", 12) == 0) {
-            log_level_str = argv[i] + 12;
-        } else if (strcmp(argv[i], "--log-file") == 0 && i + 1 < argc) {
-            log_file_path = argv[++i];
-        } else if (strncmp(argv[i], "--log-file=", 11) == 0) {
-            log_file_path = argv[i] + 11;
-        } else if (strcmp(argv[i], "--hwdec") == 0 && i + 1 < argc) {
-            hwdec_str = argv[++i];
-        } else if (strncmp(argv[i], "--hwdec=", 8) == 0) {
-            hwdec_str = argv[i] + 8;
-        } else if (strcmp(argv[i], "--audio-passthrough") == 0 && i + 1 < argc) {
-            audio_passthrough_str = argv[++i];
-        } else if (strncmp(argv[i], "--audio-passthrough=", 20) == 0) {
-            audio_passthrough_str = argv[i] + 20;
-        } else if (strcmp(argv[i], "--audio-exclusive") == 0) {
-            audio_exclusive = true;
-        } else if (strcmp(argv[i], "--audio-channels") == 0 && i + 1 < argc) {
-            audio_channels_str = argv[++i];
-        } else if (strncmp(argv[i], "--audio-channels=", 17) == 0) {
-            audio_channels_str = argv[i] + 17;
-        } else if (strcmp(argv[i], "--remote-debug-port") == 0 && i + 1 < argc) {
-            remote_debugging_port = atoi(argv[++i]);
-        } else if (strncmp(argv[i], "--remote-debug-port=", 20) == 0) {
-            remote_debugging_port = atoi(argv[i] + 20);
-        } else if (strcmp(argv[i], "--disable-gpu-compositing") == 0) {
-            disable_gpu_compositing = true;
-        } else if (strcmp(argv[i], "--ozone-platform") == 0 && i + 1 < argc) {
-            ozone_platform = argv[++i];
-        } else if (strncmp(argv[i], "--ozone-platform=", 17) == 0) {
-            ozone_platform = argv[i] + 17;
-        } else if (strcmp(argv[i], "--platform") == 0 && i + 1 < argc) {
-            platform_override = argv[++i];
-        } else if (strncmp(argv[i], "--platform=", 11) == 0) {
-            platform_override = argv[i] + 11;
-        } else {
-            fprintf(stderr, "Error: unknown argument '%s'\n", argv[i]);
-            return 1;
-        }
+    cli::Result cli_result = cli::parse(argc, argv, args);
+    switch (cli_result.kind) {
+    case cli::Result::Kind::Help:
+        cli::print_help();
+        return 0;
+    case cli::Result::Kind::Version:
+        cli::print_version();
+        return 0;
+    case cli::Result::Kind::Error:
+        fprintf(stderr, "Error: unknown argument '%s'\n", cli_result.unknown_arg.c_str());
+        return 1;
+    case cli::Result::Kind::Continue:
+        break;
     }
 
-    if (!isValidHwdec(hwdec_str)) hwdec_str = kHwdecDefault;
+    if (!isValidHwdec(args.hwdec)) args.hwdec = kHwdecDefault;
 
     // --log-file overrides default; empty argument disables file logging entirely.
     // Default to a platform log file on macOS/Windows (GUI apps have no
     // user-visible stderr there). On Linux, stderr/journalctl is the norm,
     // so file logging is opt-in via --log-file.
     std::string log_path;
-    if (log_file_path) {
-        log_path = log_file_path;
+    if (args.log_file) {
+        log_path = *args.log_file;
     } else {
 #if !defined(__linux__)
         log_path = paths::getLogPath();
 #endif
     }
     LogLevel log_level = LogLevel::Default;
-    if (log_level_str && log_level_str[0]) {
-        log_level = parseLogLevel(log_level_str);
+    if (!args.log_level.empty()) {
+        log_level = parseLogLevel(args.log_level.c_str());
         if (log_level == LogLevel::Default) {
             fprintf(stderr, "Invalid log level: '%s' (expected trace|debug|info|warn|error)\n",
-                    log_level_str);
+                    args.log_level.c_str());
             return 1;
         }
     }
@@ -582,13 +518,13 @@ int main(int argc, char* argv[]) {
 #if !defined(_WIN32) && !defined(__APPLE__)
     {
         DisplayBackend backend;
-        if (platform_override == "wayland")
+        if (args.platform_override == "wayland")
             backend = DisplayBackend::Wayland;
-        else if (platform_override == "x11")
+        else if (args.platform_override == "x11")
             backend = DisplayBackend::X11;
-        else if (!platform_override.empty()) {
+        else if (!args.platform_override.empty()) {
             fprintf(stderr, "Unknown platform: %s (expected wayland or x11)\n",
-                    platform_override.c_str());
+                    args.platform_override.c_str());
             return 1;
         } else {
             backend = (getenv("WAYLAND_DISPLAY") || !getenv("DISPLAY"))
@@ -635,6 +571,35 @@ int main(int argc, char* argv[]) {
     setenv("MPV_HOME", mpv_home.c_str(), 1);
 #endif
 
+#if !defined(_WIN32) && !defined(__APPLE__)
+    // Wire mpv through wl-proxy: mpv connects to our listener instead of
+    // the compositor; the proxy intercepts xdg_toplevel.configure +
+    // fractional_scale + drives set_fullscreen/maximized from C++.
+    // Wayland backend only; X11 path unaffected.
+    JfnWlproxy* wlproxy = nullptr;
+    if (g_platform.display == DisplayBackend::Wayland) {
+        wlproxy = jfn_wlproxy_start();
+        if (wlproxy) {
+            const char* disp = jfn_wlproxy_display_name(wlproxy);
+            if (disp && *disp) {
+                LOG_INFO(LOG_MAIN, "wlproxy listening on {}", disp);
+                setenv("WAYLAND_DISPLAY", disp, 1);
+                // Register the configure intercept BEFORE mpv_create so the
+                // first compositor configure (which arrives shortly after
+                // mpv_initialize) is captured. wl_init runs later and the
+                // same callback then drives the surface-side resize path.
+                platform::wayland::register_proxy_callbacks();
+            } else {
+                LOG_ERROR(LOG_MAIN, "wlproxy display name empty; aborting proxy");
+                jfn_wlproxy_stop(wlproxy);
+                wlproxy = nullptr;
+            }
+        } else {
+            LOG_ERROR(LOG_MAIN, "wlproxy start failed; continuing without proxy");
+        }
+    }
+#endif
+
     g_mpv = MpvHandle::Create(g_platform.display);
     if (!g_mpv.IsValid()) { LOG_ERROR(LOG_MAIN, "mpv_create failed"); return 1; }
 
@@ -649,7 +614,7 @@ int main(int argc, char* argv[]) {
 
     g_mpv.SetOptionString("user-agent", APP_USER_AGENT);
 
-    g_mpv.SetHwdec(hwdec_str);
+    g_mpv.SetHwdec(args.hwdec);
 
     // Restore saved window geometry. mpv's --geometry is always physical
     // pixels (m_geometry_apply at third_party/mpv/options/m_option.c:2296
@@ -661,16 +626,21 @@ int main(int argc, char* argv[]) {
         using WG = Settings::WindowGeometry;
         auto saved_geom = Settings::instance().windowGeometry();
 
+        int x = saved_geom.x, y = saved_geom.y;
+        float scale = g_platform.get_display_scale(x, y);
         int w, h;
-        if (saved_geom.width > 0 && saved_geom.height > 0) {
+        if (saved_geom.logical_width > 0 && saved_geom.logical_height > 0) {
+            w = static_cast<int>(std::lround(saved_geom.logical_width  * scale));
+            h = static_cast<int>(std::lround(saved_geom.logical_height * scale));
+        } else if (saved_geom.width > 0 && saved_geom.height > 0) {
             w = saved_geom.width;
             h = saved_geom.height;
         } else {
-            w = WG::kDefaultPhysicalWidth;
-            h = WG::kDefaultPhysicalHeight;
+            w = static_cast<int>(std::lround(WG::kDefaultLogicalWidth  * scale));
+            h = static_cast<int>(std::lround(WG::kDefaultLogicalHeight * scale));
         }
+        LOG_DEBUG(LOG_MAIN, "initial scale: {} -> {}x{}", scale, w, h);
 
-        int x = saved_geom.x, y = saved_geom.y;
         if (g_platform.clamp_window_geometry)
             g_platform.clamp_window_geometry(&w, &h, &x, &y);
         std::string geom_str = std::to_string(w) + "x" + std::to_string(h);
@@ -683,35 +653,35 @@ int main(int argc, char* argv[]) {
             g_mpv.SetOptionString("window-maximized", "yes");
     }
 
-    if (!audio_passthrough_str.empty()) {
+    if (!args.audio_passthrough.empty()) {
         // Normalize: dts-hd subsumes dts
-        if (audio_passthrough_str.find("dts-hd") != std::string::npos) {
+        if (args.audio_passthrough.find("dts-hd") != std::string::npos) {
             std::string filtered;
             size_t pos = 0;
-            while (pos < audio_passthrough_str.size()) {
-                size_t comma = audio_passthrough_str.find(',', pos);
-                if (comma == std::string::npos) comma = audio_passthrough_str.size();
-                std::string codec = audio_passthrough_str.substr(pos, comma - pos);
+            while (pos < args.audio_passthrough.size()) {
+                size_t comma = args.audio_passthrough.find(',', pos);
+                if (comma == std::string::npos) comma = args.audio_passthrough.size();
+                std::string codec = args.audio_passthrough.substr(pos, comma - pos);
                 if (codec != "dts") {
                     if (!filtered.empty()) filtered += ',';
                     filtered += codec;
                 }
                 pos = comma + 1;
             }
-            audio_passthrough_str = filtered;
+            args.audio_passthrough = filtered;
         }
-        g_mpv.SetAudioSpdif(audio_passthrough_str);
+        g_mpv.SetAudioSpdif(args.audio_passthrough);
     }
-    if (audio_exclusive)
+    if (args.audio_exclusive)
         g_mpv.SetAudioExclusive(true);
-    if (!audio_channels_str.empty())
-        g_mpv.SetAudioChannels(audio_channels_str);
+    if (!args.audio_channels.empty())
+        g_mpv.SetAudioChannels(args.audio_channels);
 
     // Register property observations before mpv_initialize. On macOS,
     // core_thread races to DispatchQueue.main.sync immediately after init
     // returns — main must enter the GCD pump loop without delay.
     g_mpv.SetWakeupCallback([](void*) {}, nullptr);
-    observe_properties(g_mpv);
+    observe_properties(g_mpv, g_platform.display);
 
     int init_err = g_mpv.Initialize();
     if (init_err < 0) {
@@ -742,18 +712,45 @@ int main(int argc, char* argv[]) {
     // DispatchQueue.main.sync deadlock against core_thread on macOS.
     LOG_INFO(LOG_MAIN, "Waiting for mpv window...");
     int64_t mw = 0, mh = 0;
-    // Route every PROPERTY_CHANGE through digest_property — this seeds the
-    // s_osd_pw/ph, s_fullscreen, s_display_scale atomics from mpv's initial-
-    // value events so platform init can read them without sync API calls.
-    auto try_consume_osd_dims = [&](mpv_event* ev) -> bool {
-        if (ev->event_id != MPV_EVENT_PROPERTY_CHANGE) return false;
-        MpvEvent me = digest_property(
-            ev->reply_userdata, static_cast<mpv_event_property*>(ev->data));
-        if (me.type != MpvEventType::OSD_DIMS || me.pw <= 0 || me.ph <= 0)
-            return false;
-        mw = me.pw;
-        mh = me.ph;
-        return true;
+    // First OSD_DIMS event reflects the pre-configure geometry hint, not the
+    // post-configure surface size. When maximized startup is requested, also
+    // wait for the window-maximized property to flip true (proves mpv has
+    // processed the compositor's maximize configure) and take the OSD_DIMS
+    // that follows.
+    //
+    // On Wayland we don't observe osd-dimensions: the proxy's
+    // wl_on_proxy_configure drives mpv::set_osd_dims directly, so the same
+    // osd_pw/osd_ph atomics fill from a non-mpv-event source. The poll
+    // below reads the atomics every iteration to pick up the value
+    // regardless of whether a mpv property-change event arrived.
+    bool need_max = Settings::instance().windowGeometry().maximized;
+    // On Wayland the initial logical-pixel computation in run_with_cef
+    // needs cached_scale populated by the proxy's preferred_scale callback.
+    // Wait for it explicitly — otherwise CEF starts at physical*1.0 size on
+    // fractional displays.
+#if !defined(_WIN32) && !defined(__APPLE__)
+    const bool wait_for_scale = g_platform.display == DisplayBackend::Wayland;
+#else
+    const bool wait_for_scale = false;
+#endif
+    auto consume = [&](mpv_event* ev) -> bool {
+        if (ev->event_id == MPV_EVENT_PROPERTY_CHANGE) {
+            digest_property(ev->reply_userdata,
+                            static_cast<mpv_event_property*>(ev->data));
+            if (ev->reply_userdata == MPV_OBSERVE_WINDOW_MAX &&
+                mpv::window_maximized())
+                need_max = false;
+        }
+        if (mpv::osd_pw() > 0 && mpv::osd_ph() > 0) {
+            mw = mpv::osd_pw();
+            mh = mpv::osd_ph();
+        }
+#if !defined(_WIN32) && !defined(__APPLE__)
+        bool scale_ready = !wait_for_scale || platform::wayland::scale_known();
+#else
+        bool scale_ready = true;
+#endif
+        return mw > 0 && !need_max && scale_ready;
     };
 
 #ifdef __APPLE__
@@ -768,24 +765,27 @@ int main(int argc, char* argv[]) {
         if (ev->event_id == MPV_EVENT_SHUTDOWN || ev->event_id == MPV_EVENT_END_FILE) {
             return 0;
         }
-        if (try_consume_osd_dims(ev)) break;
+        if (consume(ev)) break;
     }
 #else
+    // Short timeout so the loop polls mpv::osd_pw/ph on Wayland too — the
+    // proxy can update those atomics without producing any mpv event.
+    const double wait_timeout = g_platform.display == DisplayBackend::Wayland
+        ? 0.1 : 1.0;
     while (true) {
-        mpv_event* ev = g_mpv.WaitEvent(1.0);
+        mpv_event* ev = g_mpv.WaitEvent(wait_timeout);
         if (ev->event_id == MPV_EVENT_LOG_MESSAGE) {
             log_mpv_message(static_cast<mpv_event_log_message*>(ev->data));
             continue;
         }
         if (ev->event_id == MPV_EVENT_SHUTDOWN) return 0;
         if (ev->event_id == MPV_EVENT_END_FILE) return 0;
-        if (try_consume_osd_dims(ev)) break;
+        if (consume(ev)) break;
     }
 #endif
 
     int rc = run_with_cef(static_cast<int>(mw), static_cast<int>(mh),
-                          ozone_platform, disable_gpu_compositing,
-                          remote_debugging_port, log_level);
+                          args, log_level);
     if (rc != 0) return rc;
 
 #ifdef __APPLE__
@@ -809,6 +809,10 @@ int main(int argc, char* argv[]) {
     mpv_teardown.join();
 #else
     g_mpv.TerminateDestroy();
+#endif
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+    if (wlproxy) jfn_wlproxy_stop(wlproxy);
 #endif
 
     if (g_platform.post_window_cleanup)

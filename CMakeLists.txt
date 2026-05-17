@@ -124,8 +124,6 @@ if(APPLE)
     set(PLATFORM_SOURCES
         src/platform/macos.mm
         src/input/input_macos.mm
-        src/wake_event_macos.cpp
-        src/paths/macos.cpp
         src/playback/state_machine.cpp
         src/playback/coordinator.cpp
         src/playback/sinks/queued_sink.cpp
@@ -158,7 +156,6 @@ elseif(WIN32)
     set(PLATFORM_SOURCES
         src/platform/windows.cpp
         src/input/input_windows.cpp
-        src/paths/windows.cpp
         src/playback/state_machine.cpp
         src/playback/coordinator.cpp
         src/playback/sinks/queued_sink.cpp
@@ -235,6 +232,10 @@ else()
     set(EXT_DATA_CONTROL_PROTOCOL "${WAYLAND_PROTOCOLS_DIR}/staging/ext-data-control/ext-data-control-v1.xml")
     set(EXT_DATA_CONTROL_CLIENT_H "${WAYLAND_GENERATED_DIR}/ext-data-control-v1-client.h")
     set(EXT_DATA_CONTROL_CODE_C "${WAYLAND_GENERATED_DIR}/ext-data-control-v1-code.c")
+
+    set(XDG_OUTPUT_PROTOCOL "${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-output/xdg-output-unstable-v1.xml")
+    set(XDG_OUTPUT_CLIENT_H "${WAYLAND_GENERATED_DIR}/xdg-output-unstable-v1-client.h")
+    set(XDG_OUTPUT_CODE_C "${WAYLAND_GENERATED_DIR}/xdg-output-unstable-v1-code.c")
 
     # tablet-v2 interface symbols are referenced by cursor-shape-v1 generated code
     set(TABLET_V2_PROTOCOL "${WAYLAND_PROTOCOLS_DIR}/stable/tablet/tablet-v2.xml")
@@ -313,6 +314,18 @@ else()
         COMMENT "Generating ext-data-control-v1 code"
     )
     add_custom_command(
+        OUTPUT ${XDG_OUTPUT_CLIENT_H}
+        COMMAND ${WAYLAND_SCANNER} client-header ${XDG_OUTPUT_PROTOCOL} ${XDG_OUTPUT_CLIENT_H}
+        DEPENDS ${XDG_OUTPUT_PROTOCOL}
+        COMMENT "Generating xdg-output-unstable-v1 client header"
+    )
+    add_custom_command(
+        OUTPUT ${XDG_OUTPUT_CODE_C}
+        COMMAND ${WAYLAND_SCANNER} private-code ${XDG_OUTPUT_PROTOCOL} ${XDG_OUTPUT_CODE_C}
+        DEPENDS ${XDG_OUTPUT_PROTOCOL}
+        COMMENT "Generating xdg-output-unstable-v1 code"
+    )
+    add_custom_command(
         OUTPUT ${TABLET_V2_CLIENT_H}
         COMMAND ${WAYLAND_SCANNER} client-header ${TABLET_V2_PROTOCOL} ${TABLET_V2_CLIENT_H}
         DEPENDS ${TABLET_V2_PROTOCOL}
@@ -343,8 +356,6 @@ else()
         # Shared Linux
         src/platform/idle_inhibit_linux.cpp
         src/platform/open_url_linux.cpp
-        src/wake_event_linux.cpp
-        src/paths/linux.cpp
         src/playback/state_machine.cpp
         src/playback/coordinator.cpp
         src/playback/sinks/queued_sink.cpp
@@ -356,6 +367,7 @@ else()
         src/playback/sinks/mpris/mpris_projection.cpp
         # Wayland
         src/platform/wayland.cpp
+        src/platform/wayland_scale_probe.cpp
         src/clipboard/wayland.cpp
         src/input/input_wayland.cpp
         # Generated Wayland protocols
@@ -371,6 +383,8 @@ else()
         ${EXT_DATA_CONTROL_CLIENT_H}
         ${TABLET_V2_CODE_C}
         ${TABLET_V2_CLIENT_H}
+        ${XDG_OUTPUT_CODE_C}
+        ${XDG_OUTPUT_CLIENT_H}
     )
     if(ENABLE_KDE_PALETTE)
         list(APPEND PLATFORM_SOURCES
@@ -420,6 +434,54 @@ else()
             ${XKBCOMMON_X11_INCLUDE_DIRS}
         )
     endif()
+endif()
+
+# Rust toolchain is required for jfn-config (all platforms) and jfn-wlproxy
+# (Linux only). Locate cargo once here so both blocks share the result.
+find_program(CARGO_EXECUTABLE cargo REQUIRED)
+
+# jfn-rust — single Rust staticlib that bundles every Rust crate in this repo.
+# Each crate is a workspace rlib member; this umbrella staticlib re-exports
+# them so the final C++ link sees one copy of std/core. MSVC link.exe rejects
+# duplicate symbols across staticlibs, so we cannot ship one staticlib per
+# crate. The workspace lives at src/Cargo.toml.
+set(JFN_RUST_DIR "${CMAKE_SOURCE_DIR}/src/jfn_rust")
+set(JFN_RUST_WORKSPACE_DIR "${CMAKE_SOURCE_DIR}/src")
+set(JFN_RUST_TARGET_DIR "${CMAKE_BINARY_DIR}/jfn-rust-target")
+set(JFN_RUST_LIB "${JFN_RUST_TARGET_DIR}/release/${CMAKE_STATIC_LIBRARY_PREFIX}jfn_rust${CMAKE_STATIC_LIBRARY_SUFFIX}")
+file(GLOB_RECURSE JFN_RUST_SOURCES CONFIGURE_DEPENDS
+    "${JFN_RUST_WORKSPACE_DIR}/*/src/*.rs"
+    "${JFN_RUST_WORKSPACE_DIR}/*/Cargo.toml"
+    "${JFN_RUST_WORKSPACE_DIR}/Cargo.toml"
+)
+add_custom_command(
+    OUTPUT ${JFN_RUST_LIB}
+    COMMAND ${CMAKE_COMMAND} -E env
+        CARGO_TARGET_DIR=${JFN_RUST_TARGET_DIR}
+        ${CARGO_EXECUTABLE} build --release --manifest-path ${JFN_RUST_DIR}/Cargo.toml
+    DEPENDS ${JFN_RUST_SOURCES}
+    COMMENT "Building jfn-rust (Rust workspace)"
+    VERBATIM
+)
+add_custom_target(jfn_rust_build DEPENDS ${JFN_RUST_LIB})
+add_library(jfn_rust STATIC IMPORTED GLOBAL)
+add_dependencies(jfn_rust jfn_rust_build)
+set_target_properties(jfn_rust PROPERTIES
+    IMPORTED_LOCATION ${JFN_RUST_LIB}
+    INTERFACE_INCLUDE_DIRECTORIES
+        "${CMAKE_SOURCE_DIR}/src/cli;${CMAKE_SOURCE_DIR}/src/config;${CMAKE_SOURCE_DIR}/src/jellyfin;${CMAKE_SOURCE_DIR}/src/log_redact;${CMAKE_SOURCE_DIR}/src/paths;${CMAKE_SOURCE_DIR}/src/signal_guard;${CMAKE_SOURCE_DIR}/src/single_instance;${CMAKE_SOURCE_DIR}/src/wake_event;${CMAKE_SOURCE_DIR}/src/wlproxy"
+)
+# Native deps pulled in by the Rust standard library and our crate deps.
+# cargo rustc --print=native-static-libs emits the exact set per platform.
+if(WIN32)
+    set_property(TARGET jfn_rust APPEND PROPERTY INTERFACE_LINK_LIBRARIES
+        ws2_32 userenv advapi32 bcrypt ntdll)
+elseif(APPLE)
+    set_property(TARGET jfn_rust APPEND PROPERTY INTERFACE_LINK_LIBRARIES
+        "-framework CoreFoundation" "-framework Security")
+else()
+    set_property(TARGET jfn_rust APPEND PROPERTY INTERFACE_LINK_LIBRARIES
+        pthread dl m rt util)
 endif()
 
 # libavcodec — used to enumerate the decoders mpv will route through ffmpeg.
@@ -571,6 +633,7 @@ add_custom_target(embedded_resources DEPENDS ${EMBEDDED_RESOURCES_HEADER})
 if(WIN32)
     set(COMMON_SOURCES
         src/main.cpp
+        src/cli.cpp
         src/event_dispatcher.cpp
         src/shutdown.cpp
         src/logging.cpp
@@ -591,16 +654,16 @@ if(WIN32)
         src/browser/app_menu.cpp
         src/input/dispatch.cpp
         src/input/hotkeys.cpp
-        src/cjson/cJSON.c
         src/jellyfin/api.cpp
         src/settings.cpp
         src/paths/paths.cpp
-        src/wake_event_windows.cpp
+        src/wake_event.cpp
     )
 else()
     # Linux + macOS: shared main with platform abstraction
     set(COMMON_SOURCES
         src/main.cpp
+        src/cli.cpp
         src/event_dispatcher.cpp
         src/shutdown.cpp
         src/logging.cpp
@@ -623,7 +686,7 @@ else()
         src/single_instance.cpp
         src/settings.cpp
         src/paths/paths.cpp
-        src/cjson/cJSON.c
+        src/wake_event.cpp
         src/jellyfin/api.cpp
     )
 endif()
@@ -676,6 +739,7 @@ if(WIN32)
 else()
     target_link_libraries(jellyfin-desktop PRIVATE PkgConfig::LIBAVCODEC)
 endif()
+target_link_libraries(jellyfin-desktop PRIVATE jfn_rust)
 
 # When using external/system CEF, tell the app where to find resources
 if(EXTERNAL_CEF_DIR OR USE_SYSTEM_CEF)
