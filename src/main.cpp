@@ -75,7 +75,6 @@
 MpvHandle g_mpv;
 Color g_video_bg;
 
-PlaybackCoordinator* g_playback_coord = nullptr;
 ThemeColor* g_theme_color = nullptr;
 
 Platform g_platform{};
@@ -162,8 +161,7 @@ static void mpv_digest_thread() {
 //   browsers → CefShutdown → idle_inhibit clear → platform.cleanup
 // then main runs mpv terminate + post_window_cleanup.
 static int run_with_cef(int mw, int mh,
-                        const cli::Args& args,
-                        LogLevel log_level) {
+                        const cli::Args& args) {
     std::string ozone_platform = args.ozone_platform;
 #if !defined(_WIN32) && !defined(__APPLE__)
     if (ozone_platform.empty())
@@ -188,14 +186,16 @@ static int run_with_cef(int mw, int mh,
     // deadlock against core_thread's DispatchQueue.main.sync on macOS.
     {
         auto caps = mpv_capabilities::Query(g_mpv.Get());
-        jellyfin_device_profile::SetCachedJson(jellyfin_device_profile::Build(
+        std::string profile = jellyfin_device_profile::Build(
             caps, "Jellyfin Desktop", APP_VERSION_FULL,
-            Settings::instance().forceTranscoding()));
+            Settings::instance().forceTranscoding());
+        LOG_INFO(LOG_MAIN, "Device profile: {}", profile);
+        jellyfin_device_profile::SetCachedJson(profile);
     }
 
     bool use_shared_textures = g_platform.shared_texture_supported && !args.disable_gpu_compositing;
 
-    CefRuntime::SetLogSeverity(toCefSeverity(log_level));
+    CefRuntime::SetLogSeverity(toCefSeverity(effectiveLogLevel(LOG_CEF)));
     CefRuntime::SetRemoteDebuggingPort(args.remote_debugging_port);
     CefRuntime::SetDisableGpuCompositing(!use_shared_textures);
 #ifdef __linux__
@@ -310,14 +310,13 @@ static int run_with_cef(int mw, int mh,
     // observe playback state. Sinks register before start() so the worker
     // never delivers to a half-built fanout.
     PlaybackCoordinatorScope coord_scope;
-    g_playback_coord = &coord_scope.coord();
     auto browser_sink = std::make_shared<BrowserPlaybackSink>();
     auto idle_inhibit_sink = std::make_shared<IdleInhibitSink>();
     auto theme_color_sink = std::make_shared<ThemeColorSink>();
     auto mpv_action_sink = std::make_shared<MpvActionSink>();
-    coord_scope.coord().addSink(browser_sink);
-    coord_scope.coord().addSink(idle_inhibit_sink);
-    coord_scope.coord().addSink(theme_color_sink);
+    playback::register_event_sink(browser_sink);
+    playback::register_event_sink(idle_inhibit_sink);
+    playback::register_event_sink(theme_color_sink);
 #if defined(__APPLE__)
     auto media_sink = std::make_shared<MacosSink>();
 #elif defined(_WIN32)
@@ -327,19 +326,20 @@ static int run_with_cef(int mw, int mh,
 #else
     auto media_sink = std::make_shared<MprisSink>();
 #endif
-    coord_scope.coord().addSink(media_sink);
+    playback::register_event_sink(media_sink);
     media_sink->start();
-    coord_scope.coord().addActionSink(mpv_action_sink);
-    register_queued_sinks(
-        {browser_sink, idle_inhibit_sink, theme_color_sink},
-        {mpv_action_sink});
+    playback::register_action_sink(mpv_action_sink);
+    dispatcher::init();
+    dispatcher::set_display_scale_handler([](double s) {
+        if (g_browsers && s > 0) g_browsers->setScale(s);
+    });
 
     // Start before waitForLoad so mpv events (OSD_DIMS especially) reach
     // the platform/browsers during the overlay-only startup phase, before
     // the main browser finishes loading.
-    LOG_INFO(LOG_MAIN, "[FLOW] starting digest + cef_consumer threads");
+    LOG_INFO(LOG_MAIN, "[FLOW] starting digest + dispatcher threads");
     std::thread digest_thread(mpv_digest_thread);
-    std::thread cef_thread(cef_consumer_thread);
+    dispatcher::start();
 
 #ifndef __APPLE__
     g_web_browser->waitForLoad();
@@ -368,14 +368,13 @@ static int run_with_cef(int mw, int mh,
     g_theme_color = nullptr;
     media_sink->stop();
 
-    cef_thread.join();
+    dispatcher::stop();
+    dispatcher::shutdown();
     g_mpv.Wakeup();
     digest_thread.join();
 
     // Producers have joined; coordinator drains any in-flight inputs and
-    // stops via PlaybackCoordinatorScope dtor at end of scope. Clear the
-    // global pointer first so any late readers see "no coordinator".
-    g_playback_coord = nullptr;
+    // stops via PlaybackCoordinatorScope dtor at end of scope.
 
     // Save window geometry while mpv is still alive.
     {
@@ -500,16 +499,7 @@ int main(int argc, char* argv[]) {
         log_path = paths::getLogPath();
 #endif
     }
-    LogLevel log_level = LogLevel::Default;
-    if (!args.log_level.empty()) {
-        log_level = parseLogLevel(args.log_level.c_str());
-        if (log_level == LogLevel::Default) {
-            fprintf(stderr, "Invalid log level: '%s' (expected trace|debug|info|warn|error)\n",
-                    args.log_level.c_str());
-            return 1;
-        }
-    }
-    LoggingScope logging(log_path.c_str(), log_level);
+    LoggingScope logging(log_path.c_str(), args.log_level.c_str());
 
     LOG_INFO(LOG_MAIN, "jellyfin-desktop " APP_VERSION_FULL);
     LOG_INFO(LOG_MAIN, "CEF {}", CEF_VERSION);
@@ -688,7 +678,7 @@ int main(int argc, char* argv[]) {
         LOG_ERROR(LOG_MAIN, "mpv_initialize failed: {}", init_err);
         return 1;
     }
-    g_mpv.SetLogLevel(log_level);
+    g_mpv.SetLogLevel();
 
     // Capture user's mpv.conf bg, then force startup color. Safe here:
     // force-window=yes (not "immediate") defers VO creation, so the user's
@@ -784,8 +774,7 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    int rc = run_with_cef(static_cast<int>(mw), static_cast<int>(mh),
-                          args, log_level);
+    int rc = run_with_cef(static_cast<int>(mw), static_cast<int>(mh), args);
     if (rc != 0) return rc;
 
 #ifdef __APPLE__

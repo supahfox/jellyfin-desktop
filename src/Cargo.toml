@@ -2,14 +2,18 @@
 resolver = "3"
 members = [
     "cli",
+    "color",
     "config",
+    "idle_inhibit_linux",
     "jellyfin",
     "jfn_rust",
-    "log_redact",
+    "logging",
+    "open_url_linux",
     "paths",
+    "playback",
     "signal_guard",
     "single_instance",
-    "wake_event",
+    "wayland",
     "wlproxy",
 ]
 

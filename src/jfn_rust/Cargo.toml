@@ -10,15 +10,19 @@ crate-type = ["staticlib"]
 
 [dependencies]
 jfn-cli = { path = "../cli" }
+jfn-color = { path = "../color" }
 jfn-config = { path = "../config" }
 jfn-jellyfin = { path = "../jellyfin" }
-jfn-log-redact = { path = "../log_redact" }
+jfn-logging = { path = "../logging" }
 jfn-paths = { path = "../paths" }
+jfn-playback = { path = "../playback" }
 jfn-single-instance = { path = "../single_instance" }
-jfn-wake-event = { path = "../wake_event" }
 
 [target.'cfg(unix)'.dependencies]
 jfn-signal-guard = { path = "../signal_guard" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+jfn-idle-inhibit-linux = { path = "../idle_inhibit_linux" }
+jfn-open-url-linux = { path = "../open_url_linux" }
+jfn-wayland = { path = "../wayland" }
 jfn-wlproxy = { path = "../wlproxy" }

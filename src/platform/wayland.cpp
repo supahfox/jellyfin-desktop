@@ -2,10 +2,10 @@
 #include "cef/cef_client.h"
 #include "platform/platform.h"
 #include "platform/wayland.h"
-#include "platform/wayland_scale_probe.h"
+#include "jfn_wayland_scale_probe.h"
 #include "clipboard/wayland.h"
-#include "idle_inhibit_linux.h"
-#include "open_url_linux.h"
+#include "jfn_idle_inhibit_linux.h"
+#include "jfn_open_url_linux.h"
 #include "input/input_wayland.h"
 #include "mpv/event.h"
 #include "wlproxy/wlproxy.h"
@@ -14,7 +14,6 @@
 #include "linux-dmabuf-v1-client.h"
 #include "viewporter-client.h"
 #include "alpha-modifier-v1-client.h"
-#include "cursor-shape-v1-client.h"
 #include <drm/drm_fourcc.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -635,14 +634,8 @@ static void reg_global(void*, wl_registry* reg, uint32_t name, const char* iface
         g_wl.viewporter = static_cast<wp_viewporter*>(wl_registry_bind(reg, name, &wp_viewporter_interface, 1));
     else if (strcmp(iface, wp_alpha_modifier_v1_interface.name) == 0)
         g_wl.alpha_modifier = static_cast<wp_alpha_modifier_v1*>(wl_registry_bind(reg, name, &wp_alpha_modifier_v1_interface, 1));
-    else if (strcmp(iface, wp_cursor_shape_manager_v1_interface.name) == 0) {
-        auto* mgr = static_cast<wp_cursor_shape_manager_v1*>(wl_registry_bind(reg, name, &wp_cursor_shape_manager_v1_interface, 1));
-        input::wayland::attach_cursor_shape_manager(mgr);
-    }
-    else if (strcmp(iface, wl_seat_interface.name) == 0) {
-        auto* seat = static_cast<wl_seat*>(wl_registry_bind(reg, name, &wl_seat_interface, std::min(ver, 5u)));
-        input::wayland::attach_seat(seat);
-    }
+    // wl_seat + wp_cursor_shape_manager_v1 are bound by the Rust input layer
+    // on its own registry view, not here.
 #ifdef HAVE_KDE_DECORATION_PALETTE
     else if (strcmp(iface, org_kde_kwin_server_decoration_palette_manager_interface.name) == 0) {
         g_wl.palette_manager = static_cast<org_kde_kwin_server_decoration_palette_manager*>(
@@ -1065,7 +1058,7 @@ static bool wl_init(mpv_handle* mpv) {
 
     // Prepare the input layer so its xkb context is ready before the registry
     // callbacks land (seat_caps wires up keyboard listeners that need xkb).
-    input::wayland::init(display, g_wl.queue);
+    input::wayland::init(display);
 
     auto* reg = wl_display_get_registry(display);
     wl_proxy_set_queue(reinterpret_cast<wl_proxy*>(reg), g_wl.queue);
@@ -1130,7 +1123,7 @@ static float wl_get_scale() {
 }
 
 static float wl_get_display_scale(int x, int y) {
-    double s = wayland_scale_probe::query_scale(x, y);
+    double s = jfn_wayland_scale_probe(x, y);
     return s > 0.0 ? static_cast<float>(s) : 1.0f;
 }
 
@@ -1151,7 +1144,7 @@ static void wl_cleanup() {
     }
 
     wl_cleanup_kde_palette();
-    idle_inhibit::cleanup();
+    jfn_idle_inhibit_cleanup();
     // Clipboard worker owns its own thread + wl_event_queue; must shut
     // down before input::wayland::cleanup destroys the seat it borrowed.
     clipboard_wayland::cleanup();
@@ -1294,7 +1287,7 @@ static void wl_set_expected_size(int, int) {}
 static void wl_pump() {}
 
 static void wl_set_idle_inhibit(IdleInhibitLevel level) {
-    idle_inhibit::set(level);
+    jfn_idle_inhibit_set(static_cast<uint32_t>(level));
 }
 
 // =====================================================================
@@ -1581,6 +1574,6 @@ Platform make_wayland_platform() {
         .set_idle_inhibit = wl_set_idle_inhibit,
         .set_theme_color = wl_set_theme_color,
         .clipboard_read_text_async = clipboard_wayland::read_text_async,
-        .open_external_url = open_url_linux::open,
+        .open_external_url = [](const std::string& url) { jfn_open_url(url.c_str()); },
     };
 }

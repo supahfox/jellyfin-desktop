@@ -48,11 +48,12 @@ namespace mpv {
         if (scale <= 0.f) scale = 1.0f;
         int lw = static_cast<int>(pw / scale);
         int lh = static_cast<int>(ph / scale);
-        // g_playback_coord is null at the very earliest boot (configure may
-        // fire before the coordinator is constructed in run_with_cef). Skip
-        // the post in that window — the next configure picks it up.
-        if (g_playback_coord)
-            g_playback_coord->postOsdDims(lw, lh, pw, ph);
+        // Coordinator isn't running at the very earliest boot (configure
+        // may fire before PlaybackCoordinatorScope is constructed in
+        // run_with_cef). Skip the post in that window — the next configure
+        // picks it up.
+        if (g_playback_coord_running.load(std::memory_order_acquire))
+            playback::post_osd_dims(lw, lh, pw, ph);
     }
 
     bool read_osd_dims_from_event(mpv_event_property* p, int64_t* w, int64_t* h) {
@@ -149,6 +150,9 @@ MpvEvent digest_property(uint64_t id, mpv_event_property* p) {
         if (p->format != MPV_FORMAT_FLAG) break;
         ev.type = MpvEventType::FULLSCREEN;
         ev.flag = *static_cast<int*>(p->data) != 0;
+        // Capture maximized state at the publish boundary so the
+        // dispatcher routing path can stay free of platform calls.
+        ev.flag2 = ev.flag ? mpv::window_maximized() : false;
         s_fullscreen.store(ev.flag, std::memory_order_relaxed);
         break;
     case MPV_OBSERVE_SPEED:
@@ -198,6 +202,7 @@ MpvEvent digest_property(uint64_t id, mpv_event_property* p) {
         if (fps != s_display_hz.load(std::memory_order_relaxed)) {
             s_display_hz.store(fps, std::memory_order_relaxed);
             ev.type = MpvEventType::DISPLAY_FPS;
+            ev.dbl = fps;
         }
         break;
     }

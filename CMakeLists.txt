@@ -64,9 +64,7 @@ endif()
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     add_compile_definitions(NOMINMAX)
-    # Conforming preprocessor: quill (and fmt) rely on standard ##__VA_ARGS__
-    # handling. MSVC's legacy preprocessor mis-expands the variadic, which
-    # leaks format args into MacroMetadata's constructor call.
+    # Conforming preprocessor: fmt relies on standard ##__VA_ARGS__ handling.
     add_compile_options(/Zc:preprocessor)
 endif()
 
@@ -124,7 +122,6 @@ if(APPLE)
     set(PLATFORM_SOURCES
         src/platform/macos.mm
         src/input/input_macos.mm
-        src/playback/state_machine.cpp
         src/playback/coordinator.cpp
         src/playback/sinks/queued_sink.cpp
         src/playback/sinks/browser_sink.cpp
@@ -156,7 +153,6 @@ elseif(WIN32)
     set(PLATFORM_SOURCES
         src/platform/windows.cpp
         src/input/input_windows.cpp
-        src/playback/state_machine.cpp
         src/playback/coordinator.cpp
         src/playback/sinks/queued_sink.cpp
         src/playback/sinks/browser_sink.cpp
@@ -225,22 +221,9 @@ else()
     set(ALPHA_MODIFIER_CLIENT_H "${WAYLAND_GENERATED_DIR}/alpha-modifier-v1-client.h")
     set(ALPHA_MODIFIER_CODE_C "${WAYLAND_GENERATED_DIR}/alpha-modifier-v1-code.c")
 
-    set(CURSOR_SHAPE_PROTOCOL "${WAYLAND_PROTOCOLS_DIR}/staging/cursor-shape/cursor-shape-v1.xml")
-    set(CURSOR_SHAPE_CLIENT_H "${WAYLAND_GENERATED_DIR}/cursor-shape-v1-client.h")
-    set(CURSOR_SHAPE_CODE_C "${WAYLAND_GENERATED_DIR}/cursor-shape-v1-code.c")
-
-    set(EXT_DATA_CONTROL_PROTOCOL "${WAYLAND_PROTOCOLS_DIR}/staging/ext-data-control/ext-data-control-v1.xml")
-    set(EXT_DATA_CONTROL_CLIENT_H "${WAYLAND_GENERATED_DIR}/ext-data-control-v1-client.h")
-    set(EXT_DATA_CONTROL_CODE_C "${WAYLAND_GENERATED_DIR}/ext-data-control-v1-code.c")
-
-    set(XDG_OUTPUT_PROTOCOL "${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-output/xdg-output-unstable-v1.xml")
+set(XDG_OUTPUT_PROTOCOL "${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-output/xdg-output-unstable-v1.xml")
     set(XDG_OUTPUT_CLIENT_H "${WAYLAND_GENERATED_DIR}/xdg-output-unstable-v1-client.h")
     set(XDG_OUTPUT_CODE_C "${WAYLAND_GENERATED_DIR}/xdg-output-unstable-v1-code.c")
-
-    # tablet-v2 interface symbols are referenced by cursor-shape-v1 generated code
-    set(TABLET_V2_PROTOCOL "${WAYLAND_PROTOCOLS_DIR}/stable/tablet/tablet-v2.xml")
-    set(TABLET_V2_CLIENT_H "${WAYLAND_GENERATED_DIR}/tablet-v2-client.h")
-    set(TABLET_V2_CODE_C "${WAYLAND_GENERATED_DIR}/tablet-v2-code.c")
 
     # KDE server decoration palette (per-window titlebar colors on KWin)
     option(ENABLE_KDE_PALETTE "KDE/KWin per-window titlebar color support" ON)
@@ -290,30 +273,6 @@ else()
         COMMENT "Generating alpha-modifier-v1 code"
     )
     add_custom_command(
-        OUTPUT ${CURSOR_SHAPE_CLIENT_H}
-        COMMAND ${WAYLAND_SCANNER} client-header ${CURSOR_SHAPE_PROTOCOL} ${CURSOR_SHAPE_CLIENT_H}
-        DEPENDS ${CURSOR_SHAPE_PROTOCOL}
-        COMMENT "Generating cursor-shape-v1 client header"
-    )
-    add_custom_command(
-        OUTPUT ${CURSOR_SHAPE_CODE_C}
-        COMMAND ${WAYLAND_SCANNER} private-code ${CURSOR_SHAPE_PROTOCOL} ${CURSOR_SHAPE_CODE_C}
-        DEPENDS ${CURSOR_SHAPE_PROTOCOL}
-        COMMENT "Generating cursor-shape-v1 code"
-    )
-    add_custom_command(
-        OUTPUT ${EXT_DATA_CONTROL_CLIENT_H}
-        COMMAND ${WAYLAND_SCANNER} client-header ${EXT_DATA_CONTROL_PROTOCOL} ${EXT_DATA_CONTROL_CLIENT_H}
-        DEPENDS ${EXT_DATA_CONTROL_PROTOCOL}
-        COMMENT "Generating ext-data-control-v1 client header"
-    )
-    add_custom_command(
-        OUTPUT ${EXT_DATA_CONTROL_CODE_C}
-        COMMAND ${WAYLAND_SCANNER} private-code ${EXT_DATA_CONTROL_PROTOCOL} ${EXT_DATA_CONTROL_CODE_C}
-        DEPENDS ${EXT_DATA_CONTROL_PROTOCOL}
-        COMMENT "Generating ext-data-control-v1 code"
-    )
-    add_custom_command(
         OUTPUT ${XDG_OUTPUT_CLIENT_H}
         COMMAND ${WAYLAND_SCANNER} client-header ${XDG_OUTPUT_PROTOCOL} ${XDG_OUTPUT_CLIENT_H}
         DEPENDS ${XDG_OUTPUT_PROTOCOL}
@@ -325,19 +284,7 @@ else()
         DEPENDS ${XDG_OUTPUT_PROTOCOL}
         COMMENT "Generating xdg-output-unstable-v1 code"
     )
-    add_custom_command(
-        OUTPUT ${TABLET_V2_CLIENT_H}
-        COMMAND ${WAYLAND_SCANNER} client-header ${TABLET_V2_PROTOCOL} ${TABLET_V2_CLIENT_H}
-        DEPENDS ${TABLET_V2_PROTOCOL}
-        COMMENT "Generating tablet-v2 client header"
-    )
-    add_custom_command(
-        OUTPUT ${TABLET_V2_CODE_C}
-        COMMAND ${WAYLAND_SCANNER} private-code ${TABLET_V2_PROTOCOL} ${TABLET_V2_CODE_C}
-        DEPENDS ${TABLET_V2_PROTOCOL}
-        COMMENT "Generating tablet-v2 code"
-    )
-    if(ENABLE_KDE_PALETTE)
+if(ENABLE_KDE_PALETTE)
         add_custom_command(
             OUTPUT ${DECO_PALETTE_CLIENT_H}
             COMMAND ${WAYLAND_SCANNER} client-header ${DECO_PALETTE_PROTOCOL} ${DECO_PALETTE_CLIENT_H}
@@ -354,9 +301,6 @@ else()
 
     set(PLATFORM_SOURCES
         # Shared Linux
-        src/platform/idle_inhibit_linux.cpp
-        src/platform/open_url_linux.cpp
-        src/playback/state_machine.cpp
         src/playback/coordinator.cpp
         src/playback/sinks/queued_sink.cpp
         src/playback/sinks/browser_sink.cpp
@@ -367,7 +311,6 @@ else()
         src/playback/sinks/mpris/mpris_projection.cpp
         # Wayland
         src/platform/wayland.cpp
-        src/platform/wayland_scale_probe.cpp
         src/clipboard/wayland.cpp
         src/input/input_wayland.cpp
         # Generated Wayland protocols
@@ -377,12 +320,6 @@ else()
         ${VIEWPORTER_CLIENT_H}
         ${ALPHA_MODIFIER_CODE_C}
         ${ALPHA_MODIFIER_CLIENT_H}
-        ${CURSOR_SHAPE_CODE_C}
-        ${CURSOR_SHAPE_CLIENT_H}
-        ${EXT_DATA_CONTROL_CODE_C}
-        ${EXT_DATA_CONTROL_CLIENT_H}
-        ${TABLET_V2_CODE_C}
-        ${TABLET_V2_CLIENT_H}
         ${XDG_OUTPUT_CODE_C}
         ${XDG_OUTPUT_CLIENT_H}
     )
@@ -473,7 +410,7 @@ add_dependencies(jfn_rust jfn_rust_build)
 set_target_properties(jfn_rust PROPERTIES
     IMPORTED_LOCATION ${JFN_RUST_LIB}
     INTERFACE_INCLUDE_DIRECTORIES
-        "${CMAKE_SOURCE_DIR}/src/cli;${CMAKE_SOURCE_DIR}/src/config;${CMAKE_SOURCE_DIR}/src/jellyfin;${CMAKE_SOURCE_DIR}/src/log_redact;${CMAKE_SOURCE_DIR}/src/paths;${CMAKE_SOURCE_DIR}/src/signal_guard;${CMAKE_SOURCE_DIR}/src/single_instance;${CMAKE_SOURCE_DIR}/src/wake_event;${CMAKE_SOURCE_DIR}/src/wlproxy"
+        "${CMAKE_SOURCE_DIR}/src/cli;${CMAKE_SOURCE_DIR}/src/config;${CMAKE_SOURCE_DIR}/src/idle_inhibit_linux;${CMAKE_SOURCE_DIR}/src/jellyfin;${CMAKE_SOURCE_DIR}/src/logging;${CMAKE_SOURCE_DIR}/src/open_url_linux;${CMAKE_SOURCE_DIR}/src/paths;${CMAKE_SOURCE_DIR}/src/signal_guard;${CMAKE_SOURCE_DIR}/src/single_instance;${CMAKE_SOURCE_DIR}/src/wayland;${CMAKE_SOURCE_DIR}/src/wlproxy"
 )
 # Native deps pulled in by the Rust standard library and our crate deps.
 # cargo rustc --print=native-static-libs emits the exact set per platform.
@@ -640,13 +577,10 @@ if(WIN32)
         src/cli.cpp
         src/event_dispatcher.cpp
         src/shutdown.cpp
-        src/logging.cpp
-        src/log_redact.cpp
         src/single_instance.cpp
         src/mpv/event.cpp
         src/mpv/capabilities.cpp
         src/mpv/color.cpp
-        src/jellyfin/device_profile.cpp
         src/cef/cef_app.cpp
         src/cef/color.cpp
         src/cef/cef_client.cpp
@@ -658,8 +592,6 @@ if(WIN32)
         src/browser/app_menu.cpp
         src/input/dispatch.cpp
         src/input/hotkeys.cpp
-        src/jellyfin/api.cpp
-        src/settings.cpp
         src/paths/paths.cpp
         src/wake_event.cpp
     )
@@ -670,12 +602,9 @@ else()
         src/cli.cpp
         src/event_dispatcher.cpp
         src/shutdown.cpp
-        src/logging.cpp
-        src/log_redact.cpp
         src/mpv/event.cpp
         src/mpv/capabilities.cpp
         src/mpv/color.cpp
-        src/jellyfin/device_profile.cpp
         src/cef/cef_app.cpp
         src/cef/color.cpp
         src/cef/cef_client.cpp
@@ -688,10 +617,8 @@ else()
         src/input/dispatch.cpp
         src/input/hotkeys.cpp
         src/single_instance.cpp
-        src/settings.cpp
         src/paths/paths.cpp
         src/wake_event.cpp
-        src/jellyfin/api.cpp
     )
 endif()
 
@@ -711,14 +638,11 @@ if(WIN32)
     endif()
 endif()
 
-# quill (vendored, header-only). Disable quill's own LOG_* macros so they
-# don't collide with ours. Our pattern doesn't reference file/line/function
-# metadata, so strip it — also sidesteps MSVC's refusal to treat __FUNCTION__
-# as a constant expression in constexpr MacroMetadata initializers.
-set(QUILL_DISABLE_NON_PREFIXED_MACROS ON CACHE BOOL "" FORCE)
-set(QUILL_DISABLE_FUNCTION_NAME ON CACHE BOOL "" FORCE)
-set(QUILL_DISABLE_FILE_INFO ON CACHE BOOL "" FORCE)
-add_subdirectory(third_party/quill EXCLUDE_FROM_ALL)
+# fmt (vendored, third_party/fmt). Built static; consumed via fmt::fmt.
+set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
+set(FMT_TEST OFF CACHE BOOL "" FORCE)
+set(FMT_DOC OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/fmt EXCLUDE_FROM_ALL)
 
 # Ensure JS shims are embedded before compiling cef_app.cpp
 add_dependencies(jellyfin-desktop embedded_js embedded_resources generate_version)
@@ -736,7 +660,7 @@ target_link_libraries(jellyfin-desktop PRIVATE
     ${CEF_LIBRARIES}
     ${MPV_LIBRARIES}
     ${PLATFORM_LIBRARIES}
-    quill::quill
+    fmt::fmt
 )
 if(WIN32)
     target_link_libraries(jellyfin-desktop PRIVATE ${LIBAVCODEC_LIBRARIES})
@@ -952,15 +876,6 @@ else()
     if(EXTERNAL_MPV_DIR)
         install(FILES "${EXTERNAL_MPV_DIR}/lib/libmpv.so" DESTINATION .)
     endif()
-endif()
-
-# Tests (opt-in; existing packagers and CI are unaffected by default).
-# Default BUILD_TESTING to OFF before include(CTest) so distro builds
-# running plain `cmake ..` stay behavior-identical.
-set(BUILD_TESTING OFF CACHE BOOL "Build unit tests")
-include(CTest)
-if(BUILD_TESTING)
-    add_subdirectory(tests)
 endif()
 
 # CPack for creating distribution packages
