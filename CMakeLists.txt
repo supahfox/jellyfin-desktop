@@ -265,9 +265,7 @@ set(XDG_OUTPUT_PROTOCOL "${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-output/xdg-output
     set(PLATFORM_SOURCES
         # Shared Linux
         src/playback/sinks/queued_sink.cpp
-        # Wayland
-        src/platform/wayland.cpp
-        src/input/input_wayland.cpp
+        # Wayland (factory + input lifecycle live in Rust: src/wayland/src/)
         src/clipboard/wayland_ffi.cpp
         # Generated Wayland protocols
         ${LINUX_DMABUF_CODE_C}
@@ -280,10 +278,8 @@ set(XDG_OUTPUT_PROTOCOL "${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-output/xdg-output
         ${XDG_OUTPUT_CLIENT_H}
     )
     if(ENABLE_X11)
-        list(APPEND PLATFORM_SOURCES
-            src/platform/x11.cpp
-            src/input/input_x11.cpp
-        )
+        # X11 platform + input live in Rust (src/x11/src/). The static
+        # archive is contributed via jfn-rust below; no C++ sources.
         add_compile_definitions(HAVE_X11)
     endif()
     set(PLATFORM_LIBRARIES
@@ -375,6 +371,19 @@ elseif(APPLE)
 else()
     set_property(TARGET jfn_rust APPEND PROPERTY INTERFACE_LINK_LIBRARIES
         pthread dl m rt util)
+    # jfn-wayland + jfn-x11 link xkbcommon / xcb / xcb-cursor via `#[link]`
+    # in the corresponding -sys crates. GNU ld is single-pass left-to-right,
+    # so PLATFORM_LIBRARIES (which lists these too) ends up before jfn_rust.a
+    # and won't resolve the static archive's later-discovered references.
+    # Attach the libs to the jfn_rust target so they always trail the archive.
+    set_property(TARGET jfn_rust APPEND PROPERTY INTERFACE_LINK_LIBRARIES
+        ${XKBCOMMON_LIBRARIES})
+    if(ENABLE_X11)
+        set_property(TARGET jfn_rust APPEND PROPERTY INTERFACE_LINK_LIBRARIES
+            ${XCB_LIBRARIES}
+            ${XCB_CURSOR_LIBRARIES}
+            ${XKBCOMMON_X11_LIBRARIES})
+    endif()
 endif()
 
 # libavcodec — used to enumerate the decoders mpv will route through ffmpeg.
