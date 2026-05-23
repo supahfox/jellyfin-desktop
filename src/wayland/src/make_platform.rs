@@ -144,7 +144,9 @@ pub struct Platform {
 unsafe extern "C" {
     fn jfn_wl_lifecycle_init() -> bool;
     fn jfn_wl_lifecycle_cleanup();
+    #[cfg(feature = "kde-palette")]
     fn jfn_wl_kde_palette_post_window_cleanup();
+    #[cfg(feature = "kde-palette")]
     fn jfn_wl_kde_palette_set_color(r: u8, g: u8, b: u8, hex: *const c_char);
     fn jfn_wl_get_cached_scale() -> f32;
     fn jfn_wayland_scale_probe(x: c_int, y: c_int) -> f64;
@@ -186,6 +188,7 @@ unsafe extern "C" fn wl_cleanup() {
 }
 
 unsafe extern "C" fn wl_post_window_cleanup() {
+    #[cfg(feature = "kde-palette")]
     unsafe { jfn_wl_kde_palette_post_window_cleanup() };
 }
 
@@ -321,7 +324,15 @@ unsafe extern "C" fn wl_fade_surface(
     done_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
 ) {
     let fps = unsafe { jfn_playback_display_hz() };
-    if s.is_null() || fps <= 0.0 {
+    let surf_ptr = s as *mut crate::wl_state::PlatformSurface;
+    let can_fade = !s.is_null() && fps > 0.0 && wl_ops::surface_has_alpha(surf_ptr);
+    if !can_fade {
+        // No wp_alpha_modifier_v1 (e.g. niri) or no surface/fps: hard-unmap
+        // the subsurface so the splash disappears synchronously, then fire
+        // the callback contract inline. Mirrors X11's jfn_x11_fade_surface.
+        if !s.is_null() {
+            wl_ops::surface_set_visible(surf_ptr, false, BG_R, BG_G, BG_B);
+        }
         if let Some(f) = on_start { unsafe { f(start_ctx) } }
         if let Some(d) = start_dtor { unsafe { d(start_ctx) } }
         if let Some(f) = on_done { unsafe { f(done_ctx) } }
@@ -460,22 +471,27 @@ unsafe extern "C" fn wl_set_idle_inhibit(level: c_int) {
 }
 
 unsafe extern "C" fn wl_set_theme_color(rgb: u32) {
-    let r = ((rgb >> 16) & 0xFF) as u8;
-    let g = ((rgb >> 8) & 0xFF) as u8;
-    let b = (rgb & 0xFF) as u8;
-    // hex string "#RRGGBB\0" — same layout the C++ Color constructor would
-    // produce.
-    let mut hex: [u8; 8] = [0; 8];
-    hex[0] = b'#';
-    let hexdigit = |c: u8| if c < 10 { b'0' + c } else { b'a' + (c - 10) };
-    hex[1] = hexdigit((r >> 4) & 0xF);
-    hex[2] = hexdigit(r & 0xF);
-    hex[3] = hexdigit((g >> 4) & 0xF);
-    hex[4] = hexdigit(g & 0xF);
-    hex[5] = hexdigit((b >> 4) & 0xF);
-    hex[6] = hexdigit(b & 0xF);
-    hex[7] = 0;
-    unsafe { jfn_wl_kde_palette_set_color(r, g, b, hex.as_ptr() as *const c_char) };
+    #[cfg(feature = "kde-palette")]
+    {
+        let r = ((rgb >> 16) & 0xFF) as u8;
+        let g = ((rgb >> 8) & 0xFF) as u8;
+        let b = (rgb & 0xFF) as u8;
+        // hex string "#RRGGBB\0" — same layout the C++ Color constructor would
+        // produce.
+        let mut hex: [u8; 8] = [0; 8];
+        hex[0] = b'#';
+        let hexdigit = |c: u8| if c < 10 { b'0' + c } else { b'a' + (c - 10) };
+        hex[1] = hexdigit((r >> 4) & 0xF);
+        hex[2] = hexdigit(r & 0xF);
+        hex[3] = hexdigit((g >> 4) & 0xF);
+        hex[4] = hexdigit(g & 0xF);
+        hex[5] = hexdigit((b >> 4) & 0xF);
+        hex[6] = hexdigit(b & 0xF);
+        hex[7] = 0;
+        unsafe { jfn_wl_kde_palette_set_color(r, g, b, hex.as_ptr() as *const c_char) };
+    }
+    #[cfg(not(feature = "kde-palette"))]
+    let _ = rgb;
 }
 
 unsafe extern "C" fn wl_clipboard_read_text_async(
