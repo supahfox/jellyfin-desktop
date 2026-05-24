@@ -6,15 +6,22 @@ publish = false
 
 [lib]
 name = "jfn_rust"
-crate-type = ["staticlib"]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "jellyfin-desktop"
+path = "src/main.rs"
 
 [features]
 default = ["kde-palette"]
 kde-palette = ["jfn-cef/kde-palette", "jfn-wayland/kde-palette"]
 
 [dependencies]
+tracing = "0.1"
+jfn-platform-abi = { path = "../platform_abi" }
 jfn-cef = { path = "../jfn_cef", default-features = false }
 jfn-cli = { path = "../cli" }
+jfn-input = { path = "../input" }
 jfn-color = { path = "../color" }
 jfn-config = { path = "../config" }
 jfn-jellyfin = { path = "../jellyfin" }
@@ -26,6 +33,18 @@ jfn-single-instance = { path = "../single_instance" }
 
 [target.'cfg(unix)'.dependencies]
 jfn-signal-guard = { path = "../signal_guard" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+jfn-macos = { path = "../macos" }
+jfn-macos-sink = { path = "../macos_sink" }
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+jfn-windows = { path = "../windows" }
+jfn-windows-sink = { path = "../windows_sink" }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-resource = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 jfn-idle-inhibit-linux = { path = "../idle_inhibit_linux" }

@@ -6,9 +6,17 @@
 // into this crate, which keeps every `#[unsafe(no_mangle)] pub extern "C"` C
 // entry point visible in the resulting `libjfn_rust` archive.
 
+pub mod app;
+
 pub use jfn_cef::*;
+pub use jfn_cef::business_about::*;
+pub use jfn_cef::business_overlay::*;
+pub use jfn_cef::business_web::*;
+pub use jfn_cef::browsers::*;
 pub use jfn_cli::*;
 pub use jfn_color::*;
+pub use jfn_input::*;
+pub use jfn_color::theme::*;
 pub use jfn_config::*;
 pub use jfn_jellyfin::*;
 pub use jfn_logging::*;
@@ -20,6 +28,16 @@ pub use jfn_single_instance::*;
 
 #[cfg(unix)]
 pub use jfn_signal_guard::*;
+
+#[cfg(target_os = "macos")]
+pub use jfn_macos::*;
+#[cfg(target_os = "macos")]
+pub use jfn_macos_sink::*;
+
+#[cfg(target_os = "windows")]
+pub use jfn_windows::*;
+#[cfg(target_os = "windows")]
+pub use jfn_windows_sink::*;
 
 #[cfg(target_os = "linux")]
 pub use jfn_idle_inhibit_linux::*;

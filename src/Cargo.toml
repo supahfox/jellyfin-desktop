@@ -5,19 +5,26 @@ members = [
     "color",
     "config",
     "idle_inhibit_linux",
+    "input",
     "jellyfin",
     "jfn_cef",
     "jfn_rust",
     "logging",
+    "macos",
+    "macos_sink",
     "mpv",
     "open_url_linux",
     "paths",
+    "platform_abi",
     "playback",
     "signal_guard",
     "single_instance",
     "wayland",
+    "windows",
+    "windows_sink",
     "wlproxy",
     "x11",
+    "xtask",
 ]
 
 [profile.release]
@@ -25,4 +32,3 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
-strip = true
