@@ -44,10 +44,14 @@ fn strip_accelerator(s: &str) -> String {
     s.chars().filter(|c| *c != '&').collect()
 }
 
+// cef_event_flags_t.0 is i32 on non-macos, u32 on macos; cast keeps both green.
+#[allow(clippy::unnecessary_cast)]
 #[cfg(target_os = "macos")]
 const ACTION_MODIFIER: u32 = sys::cef_event_flags_t::EVENTFLAG_COMMAND_DOWN.0 as u32;
+#[allow(clippy::unnecessary_cast)]
 #[cfg(not(target_os = "macos"))]
 const ACTION_MODIFIER: u32 = sys::cef_event_flags_t::EVENTFLAG_CONTROL_DOWN.0 as u32;
+#[allow(clippy::unnecessary_cast)]
 const ALT_FLAG: u32 = sys::cef_event_flags_t::EVENTFLAG_ALT_DOWN.0 as u32;
 
 fn is_paste_shortcut(e: &KeyEvent) -> bool {
@@ -132,9 +136,9 @@ wrap_client! {
                     1
                 }
                 _ => {
-                    // C++ side calls CefBrowserCToCpp::Wrap / CefListValueCToCpp::Wrap which
-                    // adopt one owning reference. Rust still holds its own ref via the
-                    // Browser/ListValue wrappers, so add_ref before transferring ownership.
+                    // The callback adopts one owning reference for each ptr (CToCpp Wrap).
+                    // Rust still holds its own ref via the Browser/ListValue wrappers,
+                    // so add_ref before transferring ownership.
                     let browser_raw = browser
                         .map(|b| {
                             unsafe { Rc::add_ref(b) };

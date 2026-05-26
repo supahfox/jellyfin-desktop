@@ -28,7 +28,7 @@ const VK_F11: i32 = 0x7A;
 const EVENTFLAG_ALT_DOWN: u32 = 1 << 3;
 
 fn video_player_active() -> bool {
-    let guard = coord_slot().lock().unwrap();
+    let guard = coord_slot().lock();
     let Some(c) = guard.as_ref() else {
         return false;
     };
@@ -41,11 +41,7 @@ fn video_player_active() -> bool {
 /// Classify a key-down event. Caller invokes only for `KeyAction::Down`.
 /// Returns the [`HotkeyAction`] the dispatcher must perform; `None` means
 /// forward the event to the browser as normal.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_hotkey_classify_keydown(
-    windows_key_code: i32,
-    modifiers: u32,
-) -> u8 {
+pub fn jfn_hotkey_classify_keydown(windows_key_code: i32, modifiers: u32) -> u8 {
     if windows_key_code == VK_F4 && (modifiers & EVENTFLAG_ALT_DOWN) != 0 {
         return HotkeyAction::Shutdown as u8;
     }

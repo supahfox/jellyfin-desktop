@@ -1,7 +1,6 @@
 //! X11 init/cleanup/clamp and helpers for atom interning, ARGB visual
 //! discovery, parent geometry queries, and overlay repositioning.
 
-use std::ffi::c_char;
 use std::sync::Arc;
 
 use xcb::{Xid, XidNew, x};
@@ -9,10 +8,7 @@ use xcb::{Xid, XidNew, x};
 use crate::shm::shm_free;
 use crate::x11_state::{Atoms, CONN, MUT, Mutable, is_none_gc, is_none_window};
 
-unsafe extern "C" {
-    fn jfn_mpv_get_property_int(name: *const c_char, out: *mut i64) -> i32;
-    fn jfn_idle_inhibit_cleanup();
-}
+use jfn_mpv::api::jfn_mpv_get_property_int;
 
 /// Find a 32-bit TrueColor visual.
 fn find_argb_visual(screen: &x::Screen, depth_out: &mut u8) -> Option<x::Visualid> {
@@ -180,7 +176,7 @@ pub fn init() -> bool {
 
     // Populate the global mutable state.
     {
-        let mut g = MUT.lock().unwrap();
+        let mut g = MUT.lock();
         *g = Some(Mutable {
             screen_num,
             root,
@@ -208,25 +204,28 @@ pub fn init() -> bool {
     // `sync_overlay_positions_locked`; shutdown callback hides surfaces.
     crate::input_lifecycle::start(conn.clone(), parent);
 
-    eprintln!("[x11] platform initialized (parent=0x{:x})", parent.resource_id());
+    eprintln!(
+        "[x11] platform initialized (parent=0x{:x})",
+        parent.resource_id()
+    );
     true
 }
 
 pub fn cleanup() {
     // Defensively unmap any straggler surface windows.
     if let Some(conn) = crate::x11_state::conn() {
-        let g = MUT.lock().unwrap();
+        let g = MUT.lock();
         if let Some(m) = g.as_ref() {
             hide_all_live_locked(&conn, m);
         }
     }
 
-    unsafe { jfn_idle_inhibit_cleanup() };
+    jfn_idle_inhibit_linux::cleanup();
     crate::input_lifecycle::cleanup();
 
     // Free any surface that outlived Browsers (defensive).
     if let Some(conn) = crate::x11_state::conn() {
-        let mut g = MUT.lock().unwrap();
+        let mut g = MUT.lock();
         if let Some(m) = g.as_mut() {
             for &s_ptr in &m.live {
                 if s_ptr.is_null() {

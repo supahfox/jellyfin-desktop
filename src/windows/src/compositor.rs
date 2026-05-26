@@ -1,16 +1,15 @@
-//! D3D11 + DirectComposition per-surface compositor — native Rust port of
-//! the C++ originals in `src/platform/windows.cpp`.
+//! D3D11 + DirectComposition per-surface compositor.
 //!
-//! Owns all D3D / DComp / per-surface state. The C++ side keeps only HWND,
-//! cached scale, fullscreen bookkeeping, the WndProc hook, and the input
-//! thread; it calls into this module via the narrow `jfn_win_*` accessors
-//! at the bottom of the file to initialize, tear down, and drive the
-//! transition-locked routines.
+//! Owns all D3D / DComp / per-surface state. The platform module keeps only
+//! HWND, cached scale, fullscreen bookkeeping, the WndProc hook, and the
+//! input thread; it calls into this module via the narrow `jfn_win_*`
+//! accessors at the bottom of the file to initialize, tear down, and drive
+//! the transition-locked routines.
 
 #![allow(non_snake_case)]
 
+use parking_lot::Mutex;
 use std::ffi::{c_int, c_void};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::Win32::Foundation::{HANDLE, HWND};
@@ -23,8 +22,8 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::DirectComposition::{
-    DCompositionCreateDevice, IDCompositionDevice, IDCompositionEffectGroup,
-    IDCompositionTarget, IDCompositionVisual,
+    DCompositionCreateDevice, IDCompositionDevice, IDCompositionEffectGroup, IDCompositionTarget,
+    IDCompositionVisual,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
@@ -36,7 +35,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows_core::Interface;
 
 use crate::G_TRANSITIONING;
-use jfn_platform_abi::{JfnPopupRequest, JfnRect};
+use jfn_platform_abi::JfnRect;
 
 // =====================================================================
 // Per-surface state. Stored as `Box<Surface>` and exposed across the C
@@ -91,6 +90,9 @@ struct CompositorDevices {
     d3d_context: ID3D11DeviceContext,
     dxgi_factory: IDXGIFactory2,
     dcomp_device: IDCompositionDevice,
+    // Held only to keep the composition target (and its bound root) alive for
+    // the lifetime of the compositor; never read after construction.
+    #[allow(dead_code)]
     dcomp_target: IDCompositionTarget,
     dcomp_root: IDCompositionVisual,
 }
@@ -139,10 +141,9 @@ static STATE: Mutex<State> = Mutex::new(State {
 
 /// Build D3D11 + DXGI + DComp devices and the root visual. Returns false
 /// on failure with the partial state torn down.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_win_init_compositor(hwnd: *mut c_void) -> bool {
+pub fn jfn_win_init_compositor(hwnd: *mut c_void) -> bool {
     let hwnd = HWND(hwnd);
-    let mut st = STATE.lock().unwrap();
+    let mut st = STATE.lock();
     if st.devices.is_some() {
         return true;
     }
@@ -204,9 +205,8 @@ fn init_devices(hwnd: HWND) -> windows_core::Result<CompositorDevices> {
 
 /// Release all surfaces + devices. Called from win_cleanup (C++) after the
 /// WndProc hook is unhooked and the input thread is joined.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_win_cleanup_compositor() {
-    let mut st = STATE.lock().unwrap();
+pub fn jfn_win_cleanup_compositor() {
+    let mut st = STATE.lock();
     // Free any remaining surfaces. Browsers should normally free them
     // first, but be defensive.
     let live: Vec<*mut Surface> = std::mem::take(&mut st.live);
@@ -276,10 +276,11 @@ fn create_swap_chain(
         ..Default::default()
     };
     unsafe {
-        match devices
-            .dxgi_factory
-            .CreateSwapChainForComposition(&devices.d3d_device, &desc, None::<&windows::Win32::Graphics::Dxgi::IDXGIOutput>)
-        {
+        match devices.dxgi_factory.CreateSwapChainForComposition(
+            &devices.d3d_device,
+            &desc,
+            None::<&windows::Win32::Graphics::Dxgi::IDXGIOutput>,
+        ) {
             Ok(sc) => Some(sc),
             Err(e) => {
                 tracing::error!(target: "platform", "CreateSwapChainForComposition failed: {e:?}");
@@ -337,11 +338,7 @@ fn ensure_swap_chain(
     }
 }
 
-fn present_to_swap_chain(
-    devices: &CompositorDevices,
-    sc: &IDXGISwapChain1,
-    src: &ID3D11Texture2D,
-) {
+fn present_to_swap_chain(devices: &CompositorDevices, sc: &IDXGISwapChain1, src: &ID3D11Texture2D) {
     unsafe {
         match sc.GetBuffer::<ID3D11Texture2D>(0) {
             Ok(bb) => {
@@ -358,9 +355,8 @@ fn present_to_swap_chain(
 // Surface lifecycle + stacking.
 // =====================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_alloc_surface() -> *mut c_void {
-    let mut st = STATE.lock().unwrap();
+pub fn win_alloc_surface() -> *mut c_void {
+    let mut st = STATE.lock();
     if st.devices.is_none() {
         return std::ptr::null_mut();
     }
@@ -392,7 +388,10 @@ pub extern "C" fn win_alloc_surface() -> *mut c_void {
                 tracing::error!(target: "platform", "CreateVisual(popup) failed");
             }
 
-            match devices.dcomp_root.AddVisual(&visual, true, None::<&IDCompositionVisual>) {
+            match devices
+                .dcomp_root
+                .AddVisual(&visual, true, None::<&IDCompositionVisual>)
+            {
                 Ok(()) => s.in_tree = true,
                 Err(e) => tracing::error!(target: "platform", "AddVisual failed: {e:?}"),
             }
@@ -413,8 +412,7 @@ pub extern "C" fn win_alloc_surface() -> *mut c_void {
     ptr as *mut c_void
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_free_surface(s: *mut c_void) {
+pub fn win_free_surface(s: *mut c_void) {
     if s.is_null() {
         return;
     }
@@ -428,7 +426,7 @@ pub extern "C" fn win_free_surface(s: *mut c_void) {
         }
     }
 
-    let mut st = STATE.lock().unwrap();
+    let mut st = STATE.lock();
     if let Some(idx) = st.live.iter().position(|&q| q == p) {
         st.live.remove(idx);
     }
@@ -459,9 +457,8 @@ pub extern "C" fn win_free_surface(s: *mut c_void) {
 /// Rebuild the child-list under `dcomp_root` in `ordered` order
 /// (bottom -> top). Popup visuals stay nested under their owning surface,
 /// so they're not in this list.
-#[unsafe(no_mangle)]
-pub extern "C" fn win_restack(ordered: *const *mut c_void, n: usize) {
-    let mut st = STATE.lock().unwrap();
+pub fn win_restack(ordered: *const *mut c_void, n: usize) {
+    let mut st = STATE.lock();
     if st.devices.is_none() {
         return;
     }
@@ -529,8 +526,7 @@ pub extern "C" fn win_restack(ordered: *const *mut c_void, n: usize) {
 // Per-frame presentation.
 // =====================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
+pub fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
     if s.is_null() || raw_info.is_null() {
         return false;
     }
@@ -540,7 +536,7 @@ pub extern "C" fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -
         return false;
     }
 
-    let mut st = STATE.lock().unwrap();
+    let mut st = STATE.lock();
     if st.devices.is_none() {
         return false;
     }
@@ -612,8 +608,7 @@ pub extern "C" fn win_surface_present(s: *mut c_void, raw_info: *const c_void) -
 
 /// Software fallback: Windows is shared-textures-only in practice.
 /// No-op to match prior overlay/about behavior.
-#[unsafe(no_mangle)]
-pub extern "C" fn win_surface_present_software(
+pub fn win_surface_present_software(
     _s: *mut c_void,
     _dirty: *const JfnRect,
     _dirty_len: usize,
@@ -624,18 +619,11 @@ pub extern "C" fn win_surface_present_software(
     false
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_surface_resize(
-    s: *mut c_void,
-    _lw: c_int,
-    _lh: c_int,
-    pw: c_int,
-    ph: c_int,
-) {
+pub fn win_surface_resize(s: *mut c_void, _lw: c_int, _lh: c_int, pw: c_int, ph: c_int) {
     if s.is_null() || pw <= 0 || ph <= 0 {
         return;
     }
-    let mut st = STATE.lock().unwrap();
+    let st = STATE.lock();
     let devices = match st.devices.as_ref() {
         Some(d) => d,
         None => return,
@@ -666,12 +654,11 @@ pub extern "C" fn win_surface_resize(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_surface_set_visible(s: *mut c_void, visible: bool) {
+pub fn win_surface_set_visible(s: *mut c_void, visible: bool) {
     if s.is_null() {
         return;
     }
-    let st = STATE.lock().unwrap();
+    let st = STATE.lock();
     let devices = match st.devices.as_ref() {
         Some(d) => d,
         None => return,
@@ -705,74 +692,37 @@ pub extern "C" fn win_surface_set_visible(s: *mut c_void, visible: bool) {
 // Fade. Frame-paced on a detached thread; bounded total work.
 // =====================================================================
 
-unsafe extern "C" {
-    /// Rust-exported in src/playback/src/ingest_driver.rs.
-    fn jfn_playback_display_hz() -> f64;
-}
+use jfn_playback::ingest_driver::jfn_playback_display_hz;
 
-struct CbBox {
-    fn_: Option<unsafe extern "C" fn(*mut c_void)>,
-    ctx: *mut c_void,
-    dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-}
-
-unsafe impl Send for CbBox {}
-
-impl CbBox {
-    fn fire(&mut self) {
-        if let Some(f) = self.fn_.take() {
-            unsafe { f(self.ctx) };
-        }
+fn fire(cb: Option<Box<dyn FnOnce() + Send>>) {
+    if let Some(f) = cb {
+        f();
     }
 }
 
-impl Drop for CbBox {
-    fn drop(&mut self) {
-        if let Some(d) = self.dtor.take() {
-            unsafe { d(self.ctx) };
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn win_fade_surface(
+pub fn win_fade_surface(
     s: *mut c_void,
     fade_sec: f32,
-    on_fade_start: Option<unsafe extern "C" fn(*mut c_void)>,
-    start_ctx: *mut c_void,
-    start_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-    on_complete: Option<unsafe extern "C" fn(*mut c_void)>,
-    done_ctx: *mut c_void,
-    done_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+    on_fade_start: Option<Box<dyn FnOnce() + Send>>,
+    on_complete: Option<Box<dyn FnOnce() + Send>>,
 ) {
-    let mut start_cb = CbBox {
-        fn_: on_fade_start,
-        ctx: start_ctx,
-        dtor: start_dtor,
-    };
-    let mut done_cb = CbBox {
-        fn_: on_complete,
-        ctx: done_ctx,
-        dtor: done_dtor,
-    };
-
     if s.is_null() {
-        start_cb.fire();
-        done_cb.fire();
+        fire(on_fade_start);
+        fire(on_complete);
         return;
     }
     let p = s as *mut Surface;
     unsafe {
         if (*p).visual.is_none() || (*p).effect.is_none() {
-            start_cb.fire();
-            done_cb.fire();
+            fire(on_fade_start);
+            fire(on_complete);
             return;
         }
     }
-    let fps = unsafe { jfn_playback_display_hz() };
+    let fps = jfn_playback_display_hz();
     if fps <= 0.0 {
-        start_cb.fire();
-        done_cb.fire();
+        fire(on_fade_start);
+        fire(on_complete);
         return;
     }
 
@@ -781,20 +731,19 @@ pub extern "C" fn win_fade_surface(
     }
     let surface_addr = p as usize;
     std::thread::spawn(move || {
-        start_cb.fire();
+        fire(on_fade_start);
 
         let mut total_frames = (fade_sec as f64 * fps) as i32;
         if total_frames < 1 {
             total_frames = 1;
         }
-        let frame_duration =
-            std::time::Duration::from_micros((1e6 / fps) as u64);
+        let frame_duration = std::time::Duration::from_micros((1e6 / fps) as u64);
 
         for i in 1..=total_frames {
             let t = i as f32 / total_frames as f32;
             let opacity = 1.0_f32 - t;
             {
-                let st = STATE.lock().unwrap();
+                let st = STATE.lock();
                 let surf = unsafe { &*(surface_addr as *mut Surface) };
                 if !surf.visible || surf.visual.is_none() || surf.effect.is_none() {
                     break;
@@ -818,7 +767,7 @@ pub extern "C" fn win_fade_surface(
                 .fading
                 .store(false, Ordering::SeqCst);
         }
-        done_cb.fire();
+        fire(on_complete);
     });
 }
 
@@ -865,25 +814,19 @@ fn end_transition_locked(st: &mut State) {
 /// Called by `win_begin_transition` (in lib.rs) — replaces the old
 /// `win_begin_transition_impl` C++ helper. Takes STATE lock then runs
 /// the locked routine.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_win_begin_transition_locked() {
-    let mut st = STATE.lock().unwrap();
+pub fn jfn_win_begin_transition_locked() {
+    let mut st = STATE.lock();
     begin_transition_locked(&mut st);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_end_transition() {
-    let mut st = STATE.lock().unwrap();
+pub fn win_end_transition() {
+    let mut st = STATE.lock();
     end_transition_locked(&mut st);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_set_expected_size(w: c_int, h: c_int) {
-    let mut st = STATE.lock().unwrap();
-    if G_TRANSITIONING.load(Ordering::SeqCst)
-        && w == st.transition_pw
-        && h == st.transition_ph
-    {
+pub fn win_set_expected_size(w: c_int, h: c_int) {
+    let mut st = STATE.lock();
+    if G_TRANSITIONING.load(Ordering::SeqCst) && w == st.transition_pw && h == st.transition_ph {
         return;
     }
     st.expected_w = w;
@@ -894,15 +837,24 @@ pub extern "C" fn win_set_expected_size(w: c_int, h: c_int) {
 // Accessors used by C++ WndProc / fullscreen helpers.
 // =====================================================================
 
-/// Called from C++ WndProc on WM_SIZE: stores mpv's current physical
-/// size (used by oversized-buffer rejection) and optionally records the
-/// logical size if a transition is in progress.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_win_update_surface_size(lw: c_int, lh: c_int, pw: c_int, ph: c_int) {
-    let mut st = STATE.lock().unwrap();
+/// Called from the WndProc on WM_SIZE: stores mpv's current physical size
+/// (used by oversized-buffer rejection), records the logical size while a
+/// transition is in progress, and ends that transition once the window has
+/// settled at its new size. `force_end` ends it even if the physical size is
+/// unchanged (a fullscreen-style edge that didn't alter the client size).
+pub fn jfn_win_update_surface_size(lw: c_int, lh: c_int, pw: c_int, ph: c_int, force_end: bool) {
+    let mut st = STATE.lock();
     if G_TRANSITIONING.load(Ordering::SeqCst) {
         st.pending_lw = lw;
         st.pending_lh = lh;
+        // The size captured at begin_transition is the pre-resize size, so a
+        // differing physical size means the resize we were holding frames for
+        // has landed — end the transition and let the OSD present again. This
+        // deterministic size signal replaces the prior begin/end style toggle,
+        // which could leave the flag stuck across multiple WM_SIZE events.
+        if force_end || pw != st.transition_pw || ph != st.transition_ph {
+            end_transition_locked(&mut st);
+        }
     }
     st.mpv_pw = pw;
     st.mpv_ph = ph;
@@ -910,15 +862,13 @@ pub extern "C" fn jfn_win_update_surface_size(lw: c_int, lh: c_int, pw: c_int, p
 
 /// Called from C++ WndProc on WM_SIZE to run begin_transition under the
 /// state lock (matches the old win_begin_transition_locked behavior).
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_win_wndproc_begin_transition_locked() {
-    let mut st = STATE.lock().unwrap();
+pub fn jfn_win_wndproc_begin_transition_locked() {
+    let mut st = STATE.lock();
     begin_transition_locked(&mut st);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_win_wndproc_end_transition_locked() {
-    let mut st = STATE.lock().unwrap();
+pub fn jfn_win_wndproc_end_transition_locked() {
+    let mut st = STATE.lock();
     end_transition_locked(&mut st);
 }
 
@@ -926,35 +876,27 @@ pub extern "C" fn jfn_win_wndproc_end_transition_locked() {
 // Popup helpers.
 // =====================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_popup_show(s: *mut c_void, req: *const JfnPopupRequest) {
-    if s.is_null() || req.is_null() {
-        return;
-    }
-    let req = unsafe { &*req };
-    {
-        let _st = STATE.lock().unwrap();
-        let surf = unsafe { &mut *(s as *mut Surface) };
-        surf.popup_visible = true;
-        if let Some(pv) = surf.popup_visual.as_ref() {
-            let scale = crate::platform::win_get_scale();
-            unsafe {
-                let _ = pv.SetOffsetX2(req.x as f32 * scale);
-                let _ = pv.SetOffsetY2(req.y as f32 * scale);
-            }
-        }
-    }
-    if let Some(d) = req.on_selected_dtor {
-        unsafe { d(req.on_selected_ctx) };
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn win_popup_hide(s: *mut c_void) {
+pub fn win_popup_show(s: *mut c_void, x: c_int, y: c_int) {
     if s.is_null() {
         return;
     }
-    let st = STATE.lock().unwrap();
+    let _st = STATE.lock();
+    let surf = unsafe { &mut *(s as *mut Surface) };
+    surf.popup_visible = true;
+    if let Some(pv) = surf.popup_visual.as_ref() {
+        let scale = crate::platform::win_get_scale();
+        unsafe {
+            let _ = pv.SetOffsetX2(x as f32 * scale);
+            let _ = pv.SetOffsetY2(y as f32 * scale);
+        }
+    }
+}
+
+pub fn win_popup_hide(s: *mut c_void) {
+    if s.is_null() {
+        return;
+    }
+    let st = STATE.lock();
     let surf = unsafe { &mut *(s as *mut Surface) };
     surf.popup_visible = false;
     let pv = match surf.popup_visual.as_ref() {
@@ -974,13 +916,7 @@ pub extern "C" fn win_popup_hide(s: *mut c_void) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_popup_present(
-    s: *mut c_void,
-    raw_info: *const c_void,
-    _lw: c_int,
-    _lh: c_int,
-) {
+pub fn win_popup_present(s: *mut c_void, raw_info: *const c_void, _lw: c_int, _lh: c_int) {
     if s.is_null() || raw_info.is_null() {
         return;
     }
@@ -989,13 +925,16 @@ pub extern "C" fn win_popup_present(
     if handle.is_null() {
         return;
     }
-    let st = STATE.lock().unwrap();
+    let st = STATE.lock();
     let devices = match st.devices.as_ref() {
         Some(d) => d,
         None => return,
     };
     let src: ID3D11Texture2D = unsafe {
-        match devices.d3d_device.OpenSharedResource1::<ID3D11Texture2D>(HANDLE(handle)) {
+        match devices
+            .d3d_device
+            .OpenSharedResource1::<ID3D11Texture2D>(HANDLE(handle))
+        {
             Ok(t) => t,
             Err(_) => return,
         }
@@ -1031,8 +970,7 @@ pub extern "C" fn win_popup_present(
     present_to_swap_chain(devices, &sc, &src);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_popup_present_software(
+pub fn win_popup_present_software(
     s: *mut c_void,
     buffer: *const c_void,
     pw: c_int,
@@ -1043,7 +981,7 @@ pub extern "C" fn win_popup_present_software(
     if s.is_null() || buffer.is_null() || pw <= 0 || ph <= 0 {
         return;
     }
-    let st = STATE.lock().unwrap();
+    let st = STATE.lock();
     let devices = match st.devices.as_ref() {
         Some(d) => d,
         None => return,

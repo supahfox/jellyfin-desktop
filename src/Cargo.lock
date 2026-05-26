@@ -1025,11 +1025,17 @@ name = "jfn-cef"
 version = "0.1.0"
 dependencies = [
  "cef",
+ "jfn-color",
  "jfn-config",
+ "jfn-input",
+ "jfn-jellyfin",
  "jfn-logging",
+ "jfn-mpv",
  "jfn-paths",
  "jfn-platform-abi",
+ "jfn-playback",
  "libc",
+ "parking_lot",
  "serde_json",
 ]
 
@@ -1043,12 +1049,15 @@ dependencies = [
 [[package]]
 name = "jfn-color"
 version = "0.1.0"
+dependencies = [
+ "parking_lot",
+]
 
 [[package]]
 name = "jfn-config"
 version = "0.1.0"
 dependencies = [
- "serde",
+ "parking_lot",
  "serde_json",
 ]
 
@@ -1056,19 +1065,24 @@ dependencies = [
 name = "jfn-idle-inhibit-linux"
 version = "0.1.0"
 dependencies = [
- "log",
+ "parking_lot",
+ "tracing",
  "zbus",
 ]
 
 [[package]]
 name = "jfn-input"
 version = "0.1.0"
+dependencies = [
+ "jfn-platform-abi",
+ "jfn-playback",
+ "parking_lot",
+]
 
 [[package]]
 name = "jfn-jellyfin"
 version = "0.1.0"
 dependencies = [
- "serde",
  "serde_json",
 ]
 
@@ -1077,6 +1091,7 @@ name = "jfn-logging"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "parking_lot",
  "time",
  "tracing",
  "tracing-appender",
@@ -1089,10 +1104,14 @@ name = "jfn-macos"
 version = "0.1.0"
 dependencies = [
  "cef-dll-sys",
+ "jfn-cef",
+ "jfn-input",
+ "jfn-mpv",
  "jfn-platform-abi",
- "log",
+ "jfn-playback",
  "objc2",
  "objc2-foundation",
+ "parking_lot",
  "tracing",
 ]
 
@@ -1109,6 +1128,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-media-player",
+ "parking_lot",
  "tracing",
 ]
 
@@ -1119,6 +1139,7 @@ dependencies = [
  "bindgen",
  "jfn-color",
  "libc",
+ "parking_lot",
  "pkg-config",
  "tracing",
 ]
@@ -1127,7 +1148,7 @@ dependencies = [
 name = "jfn-open-url-linux"
 version = "0.1.0"
 dependencies = [
- "log",
+ "tracing",
 ]
 
 [[package]]
@@ -1137,6 +1158,9 @@ version = "0.1.0"
 [[package]]
 name = "jfn-platform-abi"
 version = "0.1.0"
+dependencies = [
+ "cef-dll-sys",
+]
 
 [[package]]
 name = "jfn-playback"
@@ -1144,6 +1168,7 @@ version = "0.1.0"
 dependencies = [
  "jfn-mpv",
  "libc",
+ "parking_lot",
  "serde_json",
  "windows-sys 0.61.2",
  "zbus",
@@ -1159,7 +1184,6 @@ dependencies = [
  "jfn-color",
  "jfn-config",
  "jfn-idle-inhibit-linux",
- "jfn-input",
  "jfn-jellyfin",
  "jfn-logging",
  "jfn-macos",
@@ -1169,7 +1193,6 @@ dependencies = [
  "jfn-paths",
  "jfn-platform-abi",
  "jfn-playback",
- "jfn-signal-guard",
  "jfn-single-instance",
  "jfn-wayland",
  "jfn-windows",
@@ -1181,17 +1204,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "jfn-signal-guard"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "jfn-single-instance"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "parking_lot",
  "windows-sys 0.61.2",
 ]
 
@@ -1200,12 +1217,19 @@ name = "jfn-wayland"
 version = "0.1.0"
 dependencies = [
  "cef-dll-sys",
+ "jfn-idle-inhibit-linux",
+ "jfn-input",
+ "jfn-mpv",
+ "jfn-open-url-linux",
  "jfn-platform-abi",
+ "jfn-playback",
+ "jfn-wlproxy",
  "libc",
  "libloading 0.9.0",
- "log",
  "memmap2",
+ "parking_lot",
  "smithay-client-toolkit",
+ "tracing",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
@@ -1218,7 +1242,11 @@ name = "jfn-windows"
 version = "0.1.0"
 dependencies = [
  "cef-dll-sys",
+ "jfn-input",
+ "jfn-mpv",
  "jfn-platform-abi",
+ "jfn-playback",
+ "parking_lot",
  "tracing",
  "windows",
  "windows-core",
@@ -1231,6 +1259,7 @@ dependencies = [
  "jfn-cef",
  "jfn-mpv",
  "jfn-playback",
+ "parking_lot",
  "tracing",
  "windows",
  "windows-core",
@@ -1242,7 +1271,7 @@ name = "jfn-wlproxy"
 version = "0.1.0"
 dependencies = [
  "error_reporter",
- "log",
+ "parking_lot",
  "wl-proxy",
 ]
 
@@ -1250,9 +1279,14 @@ dependencies = [
 name = "jfn-x11"
 version = "0.1.0"
 dependencies = [
+ "jfn-idle-inhibit-linux",
+ "jfn-input",
+ "jfn-mpv",
+ "jfn-open-url-linux",
  "jfn-platform-abi",
+ "jfn-playback",
  "libc",
- "log",
+ "parking_lot",
  "xcb",
  "xcb-util-cursor-sys",
  "xkbcommon",

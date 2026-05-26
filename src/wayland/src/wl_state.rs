@@ -1,9 +1,7 @@
 //! Wayland surface / present / transition state.
 //!
-//! Ported from `src/platform/wayland.cpp` as one cohesive slice — the
-//! C++ shim keeps the Platform vtable and unpacks CEF-typed structs
-//! into plain integers, then dispatches into the FFI entry points
-//! exposed by [`crate::wl_ffi`].
+//! Dispatches CEF-typed structs unpacked to plain integers into the
+//! FFI entry points exposed by [`crate::wl_ffi`].
 //!
 //! Owns:
 //!   * A dedicated `EventQueue` over an mpv-owned `wl_display`
@@ -20,13 +18,14 @@
 //! path holds the lock during commit/flush, and finer-grained locking
 //! would risk null-attach vs. commit ordering races.
 
+use parking_lot::{Mutex, MutexGuard};
 use std::ffi::c_void;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::OnceLock;
 
 use memmap2::MmapOptions;
 use wayland_backend::client::{Backend, ObjectId};
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
     wl_compositor::WlCompositor,
@@ -40,8 +39,7 @@ use wayland_client::protocol::{
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wayland_protocols::wp::alpha_modifier::v1::client::{
-    wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1,
-    wp_alpha_modifier_v1::WpAlphaModifierV1,
+    wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1, wp_alpha_modifier_v1::WpAlphaModifierV1,
 };
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1::{Flags as DmabufFlags, ZwpLinuxBufferParamsV1},
@@ -176,11 +174,7 @@ pub(crate) fn try_state() -> Option<&'static Mutex<WlState>> {
 }
 
 pub(crate) fn lock() -> MutexGuard<'static, WlState> {
-    STATE
-        .get()
-        .expect("wl_state used before init")
-        .lock()
-        .expect("wl_state mutex poisoned")
+    STATE.get().expect("wl_state used before init").lock()
 }
 
 // =====================================================================
@@ -331,12 +325,7 @@ pub(crate) fn size_in_tolerance(s: &PlatformSurface, vw: i32, vh: i32) -> bool {
 // =====================================================================
 
 /// Create a 1×1 ARGB8888 wl_buffer filled with `(r, g, b, 0xFF)`.
-pub(crate) fn create_solid_color_buffer(
-    state: &WlState,
-    r: u8,
-    g: u8,
-    b: u8,
-) -> Option<WlBuffer> {
+pub(crate) fn create_solid_color_buffer(state: &WlState, r: u8, g: u8, b: u8) -> Option<WlBuffer> {
     let fd = memfd_anon("solid-color", 4)?;
     {
         let mut mmap = unsafe { MmapOptions::new().len(4).map_mut(&fd) }.ok()?;
@@ -366,8 +355,7 @@ pub(crate) fn create_shm_buffer(
     }
     let fd = memfd_anon("cef-sw", size as usize)?;
     {
-        let mut mmap =
-            unsafe { MmapOptions::new().len(size as usize).map_mut(&fd) }.ok()?;
+        let mut mmap = unsafe { MmapOptions::new().len(size as usize).map_mut(&fd) }.ok()?;
         mmap.copy_from_slice(&pixels[..size as usize]);
     }
     let pool = state.shm.create_pool(fd.as_fd(), size, &state.qh, ());
@@ -395,7 +383,14 @@ pub(crate) fn create_dmabuf_buffer(
         (modifier >> 32) as u32,
         (modifier & 0xffff_ffff) as u32,
     );
-    let buf = params.create_immed(w, h, DRM_FORMAT_ARGB8888, DmabufFlags::empty(), &state.qh, ());
+    let buf = params.create_immed(
+        w,
+        h,
+        DRM_FORMAT_ARGB8888,
+        DmabufFlags::empty(),
+        &state.qh,
+        (),
+    );
     params.destroy();
     Some(buf)
 }

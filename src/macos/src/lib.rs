@@ -1,14 +1,4 @@
-//! Rust author of the macOS `Platform` vtable.
-//!
-//! Composition only — individual platform functions (compositor, NSApp
-//! lifecycle, idle inhibit, clipboard, etc.) still live in
-//! `src/platform/macos.mm`. They are exposed with `extern "C"` linkage so
-//! this crate can populate the vtable from them by symbol name. Subsequent
-//! slices replace each thunk with a native Rust implementation; the C ABI
-//! at the vtable boundary stays stable.
-//!
-//! Returns the shared `Platform` from `jfn-platform-abi`. Layout is pinned
-//! by `static_assert`s in `src/platform/platform_ops.cpp`.
+//! macOS `Platform` backend.
 
 #![cfg(target_os = "macos")]
 #![allow(non_snake_case)]
@@ -19,13 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub use jfn_platform_abi::{DisplayBackend, JfnPopupRequest, JfnRect, Platform};
 
 // =====================================================================
-// External C symbols (src/platform/macos.mm + src/input/input_macos.mm)
+// Backend no-op entry points.
 // =====================================================================
 
-// Stateless no-ops ported to native Rust. The C++ statics were deleted
-// so the link table picks these up by symbol name.
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_end_transition() {
+pub fn macos_end_transition() {
     // Transition-end is detected inline by macos_surface_present when
     // an incoming frame matches g_expected_w/h; the explicit vtable
     // entry is a no-op.
@@ -54,7 +41,7 @@ unsafe extern "C" {
 
 #[inline]
 fn dispatch_get_main_queue() -> *mut c_void {
-    unsafe { std::ptr::addr_of!(_dispatch_main_q) as *mut c_void }
+    std::ptr::addr_of!(_dispatch_main_q) as *mut c_void
 }
 
 /// Returns true if the current thread is the AppKit main thread. Avoids
@@ -77,8 +64,7 @@ unsafe extern "C" fn theme_color_trampoline(ctx: *mut c_void) {
 /// resize-gap stale-texture window (which CLAUDE.md explicitly accepts
 /// over stretching) matches mpv's own background — no visible flash.
 /// Hops to the main queue when called from another thread.
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_set_theme_color(rgb: u32) {
+pub fn macos_set_theme_color(rgb: u32) {
     if is_main_thread() {
         jfn_macos_apply_theme_color_on_main(rgb);
     } else {
@@ -89,7 +75,7 @@ pub extern "C" fn macos_set_theme_color(rgb: u32) {
 
 // =====================================================================
 // IOPMLib idle inhibit. Keeps an assertion alive across calls; level==0
-// releases it. Mirrors the C++ enum: 0=None, 1=System, 2=Display.
+// releases it. Levels: 0=None, 1=System, 2=Display.
 // =====================================================================
 
 #[allow(non_camel_case_types)]
@@ -131,8 +117,7 @@ const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 static G_IDLE_ASSERTION: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(K_IOPM_NULL_ASSERTION_ID);
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_set_idle_inhibit(level: c_int) {
+pub fn macos_set_idle_inhibit(level: c_int) {
     // Release any active assertion first (matches C++ behavior on every
     // call, not just level == None).
     let prev = G_IDLE_ASSERTION.swap(K_IOPM_NULL_ASSERTION_ID, Ordering::SeqCst);
@@ -140,7 +125,7 @@ pub extern "C" fn macos_set_idle_inhibit(level: c_int) {
         unsafe { IOPMAssertionRelease(prev) };
     }
 
-    // C++ enum: None=0, System=1, Display=2.
+    // Levels: None=0, System=1, Display=2.
     // kIOPMAssertionTypePrevent* are CFSTR() macros — no linker symbols;
     // build equivalent CFStrings via NoCopy using static byte strings.
     let type_cstr: &std::ffi::CStr = match level {
@@ -195,8 +180,7 @@ pub extern "C" fn macos_set_idle_inhibit(level: c_int) {
 /// Backing scale factor of `g_window`'s screen. Falls back to the main
 /// screen pre-window so default-geometry sizing at startup gets a real
 /// value instead of 1.0.
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_get_scale() -> f32 {
+pub fn macos_get_scale() -> f32 {
     unsafe {
         let win = jfn_macos_get_window();
         if !win.is_null() {
@@ -216,8 +200,7 @@ pub extern "C" fn macos_get_scale() -> f32 {
 /// Query the saved window position in backing pixels, relative to the
 /// screen's visible frame (excluding menu bar / dock), Y measured from
 /// the top. Lossless round-trip with mpv's `--geometry +X+Y`.
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_query_window_position(x: *mut c_int, y: *mut c_int) -> bool {
+pub fn macos_query_window_position(x: &mut c_int, y: &mut c_int) -> bool {
     unsafe {
         let win = jfn_macos_get_window();
         if win.is_null() {
@@ -231,8 +214,7 @@ pub extern "C" fn macos_query_window_position(x: *mut c_int, y: *mut c_int) -> b
         let visible: objc2_foundation::NSRect = objc2::msg_send![screen, visibleFrame];
         let scale: f64 = objc2::msg_send![screen, backingScaleFactor];
         let lx = frame.origin.x - visible.origin.x;
-        let ly = (visible.origin.y + visible.size.height)
-            - (frame.origin.y + frame.size.height);
+        let ly = (visible.origin.y + visible.size.height) - (frame.origin.y + frame.size.height);
         *x = (lx * scale) as c_int;
         *y = (ly * scale) as c_int;
         true
@@ -249,21 +231,18 @@ pub extern "C" fn macos_query_window_position(x: *mut c_int, y: *mut c_int) -> b
 
 pub(crate) static G_IN_TRANSITION: AtomicBool = AtomicBool::new(false);
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_begin_transition() {
+pub fn macos_begin_transition() {
     G_IN_TRANSITION.store(true, Ordering::SeqCst);
     compositor::drop_input_textures();
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_in_transition() -> bool {
+pub fn macos_in_transition() -> bool {
     G_IN_TRANSITION.load(Ordering::SeqCst)
 }
 
 /// Called by C++ macos_surface_present when an incoming frame matches
 /// the expected post-transition size.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_macos_transition_clear() {
+pub fn jfn_macos_transition_clear() {
     G_IN_TRANSITION.store(false, Ordering::SeqCst);
 }
 
@@ -271,8 +250,7 @@ pub extern "C" fn jfn_macos_transition_clear() {
 /// original ignored them too because a saved (x, y) in backing pixels
 /// can't be unambiguously mapped to an `NSScreen` without identity
 /// persistence.
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_get_display_scale(_x: c_int, _y: c_int) -> f32 {
+pub fn macos_get_display_scale(_x: c_int, _y: c_int) -> f32 {
     unsafe {
         let screen: *mut objc2::runtime::AnyObject =
             objc2::msg_send![objc2::class!(NSScreen), mainScreen];
@@ -287,13 +265,7 @@ pub extern "C" fn macos_get_display_scale(_x: c_int, _y: c_int) -> f32 {
 /// Clamp the saved (w, h, x, y) window geometry — in backing pixels,
 /// relative to the main screen's visible frame — so the window stays
 /// fully on-screen. Centers any unset axis (negative input).
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_clamp_window_geometry(
-    w: *mut c_int,
-    h: *mut c_int,
-    x: *mut c_int,
-    y: *mut c_int,
-) {
+pub fn macos_clamp_window_geometry(w: &mut c_int, h: &mut c_int, x: &mut c_int, y: &mut c_int) {
     unsafe {
         let screen: *mut objc2::runtime::AnyObject =
             objc2::msg_send![objc2::class!(NSScreen), mainScreen];
@@ -334,8 +306,7 @@ pub extern "C" fn macos_clamp_window_geometry(
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_surface_present_software(
+pub fn macos_surface_present_software(
     _s: *mut c_void,
     _dirty: *const JfnRect,
     _dirty_len: usize,
@@ -350,9 +321,8 @@ pub extern "C" fn macos_surface_present_software(
 
 // macos_early_init / macos_init / macos_cleanup + jfn_macos_get_input_view
 // now live in src/macos/src/init.rs.
-use crate::init::{
-    jfn_macos_get_input_view, macos_cleanup, macos_early_init, macos_init,
-};
+pub use crate::init::jfn_macos_query_logical_content_size;
+use crate::init::{macos_cleanup, macos_early_init, macos_init};
 
 // jfn_input_macos_set_cursor lives in src/macos/src/input.rs (Rust).
 use input::jfn_input_macos_set_cursor;
@@ -363,41 +333,32 @@ use input::jfn_input_macos_set_cursor;
 // guard to match the original behavior.
 // =====================================================================
 
-unsafe extern "C" {
-    fn jfn_mpv_handle_get() -> *mut c_void;
-    fn jfn_mpv_set_fullscreen(v: bool);
-    fn jfn_mpv_toggle_fullscreen();
-}
+use jfn_mpv::api::{jfn_mpv_set_fullscreen, jfn_mpv_toggle_fullscreen};
+use jfn_mpv::boot::jfn_mpv_handle_get;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_set_fullscreen(fullscreen: bool) {
-    if unsafe { jfn_mpv_handle_get() }.is_null() {
+pub fn macos_set_fullscreen(fullscreen: bool) {
+    if jfn_mpv_handle_get().is_null() {
         return;
     }
-    unsafe { jfn_mpv_set_fullscreen(fullscreen) };
+    jfn_mpv_set_fullscreen(fullscreen);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_toggle_fullscreen() {
-    if unsafe { jfn_mpv_handle_get() }.is_null() {
+pub fn macos_toggle_fullscreen() {
+    if jfn_mpv_handle_get().is_null() {
         return;
     }
-    unsafe { jfn_mpv_toggle_fullscreen() };
+    jfn_mpv_toggle_fullscreen();
 }
 
 // =====================================================================
-// Message pump / NSApplication run loop / wake. The C++ originals
-// lived in src/platform/macos.mm; ported here so the C++ side no
-// longer owns any AppKit lifecycle primitives. Symbol names are kept
-// (`macos_pump`, etc.) because src/platform/macos.mm still calls
-// `macos_pump()` directly during `macos_init`'s wait-for-window loop;
-// the link table picks up this Rust definition.
+// Message pump / NSApplication run loop / wake.
 // =====================================================================
 
 type CFRunLoopRef = *const c_void;
 
 unsafe extern "C" {
-    fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source_handled: i32) -> i32;
+    fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source_handled: i32)
+    -> i32;
     fn CFRunLoopGetMain() -> CFRunLoopRef;
     fn CFRunLoopWakeUp(rl: CFRunLoopRef);
     static kCFRunLoopDefaultMode: CFStringRef;
@@ -413,8 +374,7 @@ const NS_EVENT_MASK_ANY: u64 = u64::MAX;
 /// CEF's wake source, GCD main-queue blocks). Used during the
 /// pre-CefInitialize wait-for-VO loop where we interleave with mpv
 /// events and during the macos_init wait-for-window loop.
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_pump() {
+pub fn macos_pump() {
     unsafe {
         // @autoreleasepool — bracket allocations from sendEvent / event
         // delivery so AppKit temporaries don't accumulate.
@@ -450,8 +410,7 @@ pub extern "C" fn macos_pump() {
 /// NSDefaultRunLoopMode does not. CFRunLoop sources installed in
 /// CommonModes (CEF wake source, GCD main-queue blocks) all fire from
 /// inside this call without polling.
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_run_main_loop() {
+pub fn macos_run_main_loop() {
     unsafe {
         let app: *mut objc2::runtime::AnyObject =
             objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
@@ -495,10 +454,13 @@ unsafe extern "C" fn wake_trampoline(_ctx: *mut c_void) {
 /// `dispatch_async_f` and from there calls `-stop:` plus a sentinel
 /// NSEvent so the loop wakes and exits on its next iteration. The
 /// trampoline carries no state — wake is fire-and-forget.
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_wake_main_loop() {
+pub fn macos_wake_main_loop() {
     unsafe {
-        dispatch_async_f(dispatch_get_main_queue(), std::ptr::null_mut(), wake_trampoline);
+        dispatch_async_f(
+            dispatch_get_main_queue(),
+            std::ptr::null_mut(),
+            wake_trampoline,
+        );
         // Belt-and-suspenders: also wake the main CFRunLoop directly in
         // case the main thread is currently in CFRunLoopRunInMode rather
         // than [NSApp run]. Harmless when [NSApp run] is active.
@@ -512,12 +474,7 @@ pub extern "C" fn macos_wake_main_loop() {
 // are synchronous so the callback fires inline on the calling thread.
 // =====================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_clipboard_read_text_async(
-    on_done: Option<unsafe extern "C" fn(*mut c_void, *const c_char, usize)>,
-    ctx: *mut c_void,
-    dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-) {
+pub fn macos_clipboard_read_text_async(on_done: Box<dyn FnOnce(&str) + Send>) {
     // NSPasteboardTypeString is the canonical string UTI ("public.utf8-plain-text").
     let utf8_bytes = unsafe {
         let pb: *mut objc2::runtime::AnyObject =
@@ -531,8 +488,7 @@ pub extern "C" fn macos_clipboard_read_text_async(
                 objc2::class!(NSString),
                 stringWithUTF8String: type_cstr.as_ptr()
             ];
-            let ns: *mut objc2::runtime::AnyObject =
-                objc2::msg_send![pb, stringForType: ns_type];
+            let ns: *mut objc2::runtime::AnyObject = objc2::msg_send![pb, stringForType: ns_type];
             if ns.is_null() {
                 None
             } else {
@@ -550,36 +506,27 @@ pub extern "C" fn macos_clipboard_read_text_async(
         }
     };
 
-    if let Some(cb) = on_done {
-        let (ptr, len) = match &utf8_bytes {
-            Some(v) => (v.as_ptr() as *const c_char, v.len()),
-            None => (c"".as_ptr(), 0),
-        };
-        unsafe { cb(ctx, ptr, len) };
-    }
-    if let Some(d) = dtor {
-        unsafe { d(ctx) };
-    }
+    let text = match &utf8_bytes {
+        Some(v) => std::str::from_utf8(v).unwrap_or(""),
+        None => "",
+    };
+    on_done(text);
 }
 
-/// Open an external URL via NSWorkspace. utf8/len is borrowed for the
-/// duration of the call.
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_open_external_url(utf8: *const c_char, len: usize) {
-    if utf8.is_null() || len == 0 {
+/// Open an external URL via NSWorkspace.
+pub fn macos_open_external_url(url: &str) {
+    if url.is_empty() {
         return;
     }
     unsafe {
         // Build an NSString from the borrowed UTF-8 bytes (NSString copies).
-        let bytes = std::slice::from_raw_parts(utf8 as *const u8, len);
-        let ns_str: *mut objc2::runtime::AnyObject = objc2::msg_send![
-            objc2::class!(NSString),
-            alloc
-        ];
+        let bytes = url.as_bytes();
+        let ns_str: *mut objc2::runtime::AnyObject =
+            objc2::msg_send![objc2::class!(NSString), alloc];
         let ns_str: *mut objc2::runtime::AnyObject = objc2::msg_send![
             ns_str,
             initWithBytes: bytes.as_ptr() as *const c_void,
-            length: len,
+            length: bytes.len(),
             encoding: 4u64 // NSUTF8StringEncoding
         ];
         if ns_str.is_null() {
@@ -594,10 +541,8 @@ pub extern "C" fn macos_open_external_url(utf8: *const c_char, len: usize) {
         if nsurl.is_null() {
             return;
         }
-        let ws: *mut objc2::runtime::AnyObject = objc2::msg_send![
-            objc2::class!(NSWorkspace),
-            sharedWorkspace
-        ];
+        let ws: *mut objc2::runtime::AnyObject =
+            objc2::msg_send![objc2::class!(NSWorkspace), sharedWorkspace];
         if ws.is_null() {
             return;
         }
@@ -678,14 +623,7 @@ impl Platform for MacosPlatform {
         macos_surface_present_software(s, dirty, dirty_len, buffer, w, h)
     }
 
-    fn surface_resize(
-        &self,
-        s: SurfaceHandle,
-        lw: c_int,
-        lh: c_int,
-        pw: c_int,
-        ph: c_int,
-    ) {
+    fn surface_resize(&self, s: SurfaceHandle, lw: c_int, lh: c_int, pw: c_int, ph: c_int) {
         macos_surface_resize(s, lw, lh, pw, ph);
     }
 
@@ -701,19 +639,13 @@ impl Platform for MacosPlatform {
         &self,
         s: SurfaceHandle,
         sec: f32,
-        on_start: Option<unsafe extern "C" fn(*mut c_void)>,
-        start_ctx: *mut c_void,
-        start_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-        on_done: Option<unsafe extern "C" fn(*mut c_void)>,
-        done_ctx: *mut c_void,
-        done_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+        on_start: Option<Box<dyn FnOnce() + Send>>,
+        on_done: Option<Box<dyn FnOnce() + Send>>,
     ) {
-        macos_fade_surface(
-            s, sec, on_start, start_ctx, start_dtor, on_done, done_ctx, done_dtor,
-        );
+        macos_fade_surface(s, sec, on_start, on_done);
     }
 
-    fn popup_show(&self, s: SurfaceHandle, req: *const JfnPopupRequest) {
+    fn popup_show(&self, s: SurfaceHandle, req: JfnPopupRequest) {
         macos_popup_show(s, req);
     }
 
@@ -749,17 +681,11 @@ impl Platform for MacosPlatform {
         macos_get_display_scale(x, y)
     }
 
-    fn query_window_position(&self, x: *mut c_int, y: *mut c_int) -> bool {
+    fn query_window_position(&self, x: &mut c_int, y: &mut c_int) -> bool {
         macos_query_window_position(x, y)
     }
 
-    fn clamp_window_geometry(
-        &self,
-        w: *mut c_int,
-        h: *mut c_int,
-        x: *mut c_int,
-        y: *mut c_int,
-    ) {
+    fn clamp_window_geometry(&self, w: &mut c_int, h: &mut c_int, x: &mut c_int, y: &mut c_int) {
         macos_clamp_window_geometry(w, h, x, y);
     }
 
@@ -787,17 +713,12 @@ impl Platform for MacosPlatform {
         macos_set_theme_color(rgb);
     }
 
-    fn clipboard_read_text_async(
-        &self,
-        on_done: Option<unsafe extern "C" fn(*mut c_void, *const c_char, usize)>,
-        ctx: *mut c_void,
-        dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-    ) {
-        macos_clipboard_read_text_async(on_done, ctx, dtor);
+    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(&str) + Send>) {
+        macos_clipboard_read_text_async(on_done);
     }
 
-    fn open_external_url(&self, utf8: *const c_char, len: usize) {
-        macos_open_external_url(utf8, len);
+    fn open_external_url(&self, url: &str) {
+        macos_open_external_url(url);
     }
 }
 

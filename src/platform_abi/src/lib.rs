@@ -5,26 +5,51 @@
 //! `make_*_platform()` factory. The binary installs the chosen backend into
 //! the [`OnceLock`] below via [`install`] / [`get`].
 //!
-//! The previous C-ABI `Platform` struct (a vtable of `Option<extern "C"
-//! fn(...)>`) is gone — backends now author native Rust methods on a
-//! concrete impl rather than populating a fn-pointer table. The shared
-//! types (`JfnRect`, `JfnPopupRequest`, `DisplayBackend`) stay `#[repr(C)]`
-//! so they can still cross the CEF C ABI surface (`OnAcceleratedPaint`
-//! accel-paint info etc).
+//! `JfnRect` stays `#[repr(C)]` because CEF's `OnAcceleratedPaint` accel-paint
+//! info hands it across the C ABI surface; the popup request and other
+//! payloads are plain Rust.
 
 #![allow(non_snake_case)]
 
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
-#[repr(i32)]
+/// Canonical `cef_cursor_type_t` ordinals, the single source of truth for the
+/// cursor codes that flow through [`Platform::set_cursor`]. Values are derived
+/// from the generated CEF bindings so backends can never hand-copy (and drift
+/// from) them — every platform mapper imports these instead of redefining the
+/// enum locally. Typed `c_int` to match `set_cursor`'s parameter.
+pub mod cursor {
+    use cef_dll_sys::cef_cursor_type_t as ct;
+    use std::ffi::c_int;
+
+    macro_rules! cursor_consts {
+        ($($name:ident),* $(,)?) => {
+            $(pub const $name: c_int = ct::$name as c_int;)*
+        };
+    }
+
+    cursor_consts! {
+        CT_POINTER, CT_CROSS, CT_HAND, CT_IBEAM, CT_WAIT, CT_HELP,
+        CT_EASTRESIZE, CT_NORTHRESIZE, CT_NORTHEASTRESIZE, CT_NORTHWESTRESIZE,
+        CT_SOUTHRESIZE, CT_SOUTHEASTRESIZE, CT_SOUTHWESTRESIZE, CT_WESTRESIZE,
+        CT_NORTHSOUTHRESIZE, CT_EASTWESTRESIZE, CT_NORTHEASTSOUTHWESTRESIZE,
+        CT_NORTHWESTSOUTHEASTRESIZE, CT_COLUMNRESIZE, CT_ROWRESIZE,
+        CT_MIDDLEPANNING, CT_EASTPANNING, CT_NORTHPANNING, CT_NORTHEASTPANNING,
+        CT_NORTHWESTPANNING, CT_SOUTHPANNING, CT_SOUTHEASTPANNING,
+        CT_SOUTHWESTPANNING, CT_WESTPANNING, CT_MOVE, CT_VERTICALTEXT, CT_CELL,
+        CT_CONTEXTMENU, CT_ALIAS, CT_PROGRESS, CT_NODROP, CT_COPY, CT_NONE,
+        CT_NOTALLOWED, CT_ZOOMIN, CT_ZOOMOUT, CT_GRAB, CT_GRABBING,
+        CT_MIDDLE_PANNING_VERTICAL, CT_MIDDLE_PANNING_HORIZONTAL,
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum DisplayBackend {
-    Wayland = 0,
-    X11 = 1,
-    Windows = 2,
-    MacOS = 3,
+    Wayland,
+    X11,
+    Windows,
+    MacOS,
 }
 
 #[repr(C)]
@@ -35,35 +60,33 @@ pub struct JfnRect {
     pub h: c_int,
 }
 
-#[repr(C)]
 pub struct JfnPopupRequest {
     pub x: c_int,
     pub y: c_int,
     pub lw: c_int,
     pub lh: c_int,
-    pub options: *const *const c_char,
-    pub options_len: usize,
+    pub options: Vec<String>,
     pub initial_highlight: c_int,
-    pub on_selected: Option<unsafe extern "C" fn(*mut c_void, c_int)>,
-    pub on_selected_ctx: *mut c_void,
-    pub on_selected_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+    /// Fires on the platform backend's thread when the user picks an
+    /// option (or `-1` for cancel). Native-menu backends (macOS) call
+    /// it; compositor backends (Wayland / X11 / Windows) drop the
+    /// closure without firing — CEF dispatches selection itself.
+    pub on_selected: Option<Box<dyn FnOnce(c_int) + Send>>,
 }
 
-/// Idle-inhibit level. Mirrors C++ `IdleInhibitLevel`.
-#[repr(i32)]
+/// Idle-inhibit level.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum IdleInhibitLevel {
-    None = 0,
-    System = 1,
-    Display = 2,
+    None,
+    System,
+    Display,
 }
 
 /// Backend-allocated per-surface handle. Backends define the layout
 /// in-crate; callers only ever hold the raw pointer.
 pub type SurfaceHandle = *mut c_void;
 
-/// Process-wide platform handle. Each method maps 1:1 to the previous
-/// vtable slot; `Option`-able vtable slots become default no-op methods so
+/// Process-wide platform handle. Optional methods have no-op defaults so
 /// backends only override what they care about.
 ///
 /// All methods take `&self` — backends keep their own interior mutability
@@ -98,42 +121,28 @@ pub trait Platform: Send + Sync {
     ) -> bool {
         false
     }
-    fn surface_resize(
-        &self,
-        _s: SurfaceHandle,
-        _lw: c_int,
-        _lh: c_int,
-        _pw: c_int,
-        _ph: c_int,
-    ) {
-    }
+    fn surface_resize(&self, _s: SurfaceHandle, _lw: c_int, _lh: c_int, _pw: c_int, _ph: c_int) {}
     fn surface_set_visible(&self, _s: SurfaceHandle, _visible: bool) {}
     fn restack(&self, _ordered: *const SurfaceHandle, _n: usize) {}
-    #[allow(clippy::too_many_arguments)]
     fn fade_surface(
         &self,
         _s: SurfaceHandle,
         _sec: f32,
-        _on_start: Option<unsafe extern "C" fn(*mut c_void)>,
-        _start_ctx: *mut c_void,
-        _start_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-        _on_done: Option<unsafe extern "C" fn(*mut c_void)>,
-        _done_ctx: *mut c_void,
-        _done_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+        on_start: Option<Box<dyn FnOnce() + Send>>,
+        on_done: Option<Box<dyn FnOnce() + Send>>,
     ) {
+        if let Some(f) = on_start {
+            f();
+        }
+        if let Some(f) = on_done {
+            f();
+        }
     }
 
     // Popup
-    fn popup_show(&self, _s: SurfaceHandle, _req: *const JfnPopupRequest) {}
+    fn popup_show(&self, _s: SurfaceHandle, _req: JfnPopupRequest) {}
     fn popup_hide(&self, _s: SurfaceHandle) {}
-    fn popup_present(
-        &self,
-        _s: SurfaceHandle,
-        _info: *const c_void,
-        _lw: c_int,
-        _lh: c_int,
-    ) {
-    }
+    fn popup_present(&self, _s: SurfaceHandle, _info: *const c_void, _lw: c_int, _lh: c_int) {}
     fn popup_present_software(
         &self,
         _s: SurfaceHandle,
@@ -164,15 +173,15 @@ pub trait Platform: Send + Sync {
         1.0
     }
 
-    fn query_window_position(&self, _x: *mut c_int, _y: *mut c_int) -> bool {
+    fn query_window_position(&self, _x: &mut c_int, _y: &mut c_int) -> bool {
         false
     }
     fn clamp_window_geometry(
         &self,
-        _w: *mut c_int,
-        _h: *mut c_int,
-        _x: *mut c_int,
-        _y: *mut c_int,
+        _w: &mut c_int,
+        _h: &mut c_int,
+        _x: &mut c_int,
+        _y: &mut c_int,
     ) {
     }
 
@@ -197,8 +206,8 @@ pub trait Platform: Send + Sync {
     fn cef_ozone_platform(&self) -> *const c_char {
         ozone_platform_get()
     }
-    fn set_cef_ozone_platform(&self, utf8: *const c_char) {
-        ozone_platform_set(utf8);
+    fn set_cef_ozone_platform(&self, name: &str) {
+        ozone_platform_set(name);
     }
 
     /// Whether [`clipboard_read_text_async`] will actually invoke the
@@ -209,28 +218,15 @@ pub trait Platform: Send + Sync {
         true
     }
 
-    fn clipboard_read_text_async(
-        &self,
-        on_done: Option<unsafe extern "C" fn(*mut c_void, *const c_char, usize)>,
-        ctx: *mut c_void,
-        dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-    ) {
-        // No backend support — fire empty callback and dtor synchronously,
-        // matching the old C++ fallback in `platform_ops.cpp`.
-        unsafe {
-            if let Some(cb) = on_done {
-                cb(ctx, c"".as_ptr(), 0);
-            }
-            if let Some(d) = dtor {
-                d(ctx);
-            }
-        }
+    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(&str) + Send>) {
+        // No backend support — invoke with empty text synchronously.
+        on_done("");
     }
     /// Disable subsequent clipboard reads (set by Wayland when no data
     /// device manager is available).
     fn clear_clipboard_handler(&self) {}
 
-    fn open_external_url(&self, _utf8: *const c_char, _len: usize) {}
+    fn open_external_url(&self, _url: &str) {}
 }
 
 // =====================================================================
@@ -254,26 +250,20 @@ pub fn install(p: Box<dyn Platform>) {
 }
 
 // CEF ozone platform name (NUL-terminated). Set once by jfn_app_main
-// before `Platform::init`; read by the Wayland dmabuf probe and the C++
-// side via `jfn_platform_cef_ozone_platform`. Kept in `Mutex` for the
-// (very rare) set, but stable for read.
-static OZONE_PLATFORM: AtomicPtr<c_char> = AtomicPtr::new(std::ptr::null_mut());
+// before `Platform::init`; read by the Wayland dmabuf probe.
+static OZONE_PLATFORM: OnceLock<CString> = OnceLock::new();
 
 fn ozone_platform_get() -> *const c_char {
-    let p = OZONE_PLATFORM.load(Ordering::Acquire);
-    if p.is_null() { c"".as_ptr() } else { p as *const c_char }
+    match OZONE_PLATFORM.get() {
+        Some(cs) => cs.as_ptr(),
+        None => c"".as_ptr(),
+    }
 }
 
-fn ozone_platform_set(utf8: *const c_char) {
-    let cs = if utf8.is_null() {
-        CString::default()
-    } else {
-        unsafe { std::ffi::CStr::from_ptr(utf8).to_owned() }
-    };
-    // Leak: process-static string, one assignment per boot. Previous value
-    // (if any) is leaked too; cheap on a 32-byte string.
-    let leaked = cs.into_raw();
-    OZONE_PLATFORM.store(leaked, Ordering::Release);
+fn ozone_platform_set(name: &str) {
+    let cs = CString::new(name).unwrap_or_default();
+    // Best-effort: silently ignore a second set so callers can stay simple.
+    let _ = OZONE_PLATFORM.set(cs);
 }
 
 /// Returns the installed platform backend. Panics if [`install`] hasn't
@@ -292,81 +282,60 @@ pub fn try_get() -> Option<&'static dyn Platform> {
 }
 
 // =====================================================================
-// C ABI thunks for legacy C/C++ call sites and (currently) several
-// Rust crates that haven't been re-pointed yet. Each thunk dispatches
-// through the global platform handle.
-//
-// These exports replace the C++ `jfn_platform_*` / `jfn_g_platform_*`
-// accessors previously defined in src/platform/platform_ops.cpp.
+// Browser bridge
 // =====================================================================
+//
+// Lets crates that can't depend on jfn_cef (input, macos) forward events
+// to whichever CEF layer is currently active. jfn_cef installs the impl
+// at boot; the trait methods resolve the active layer internally so
+// callers never see a JfnCefLayer pointer.
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_platform_toggle_fullscreen() {
-    if let Some(p) = try_get() {
-        p.toggle_fullscreen();
-    }
+pub trait BrowserBridge: Send + Sync {
+    #[allow(clippy::too_many_arguments)] // mirrors CEF's KeyEvent layout 1:1
+    fn send_key_event(
+        &self,
+        type_: c_int,
+        modifiers: u32,
+        windows_key_code: c_int,
+        native_key_code: c_int,
+        is_system_key: bool,
+        character: u16,
+        unmodified_character: u16,
+    );
+    fn send_mouse_click(
+        &self,
+        x: c_int,
+        y: c_int,
+        modifiers: u32,
+        button: c_int,
+        mouse_up: bool,
+        click_count: c_int,
+    );
+    fn send_mouse_move(&self, x: i32, y: i32, modifiers: u32, leave: bool);
+    fn send_mouse_wheel(&self, x: c_int, y: c_int, modifiers: u32, delta_x: c_int, delta_y: c_int);
+    fn set_focus(&self, focus: bool);
+    fn navigate_history(&self, forward: bool);
+    fn undo(&self);
+    fn redo(&self);
+    fn cut(&self);
+    fn copy(&self);
+    fn paste(&self);
+    fn select_all(&self);
+    /// True if a layer is currently active. Cheap check used by callers
+    /// that want to early-out before building an event payload.
+    fn has_active(&self) -> bool;
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_platform_set_fullscreen(v: bool) {
-    if let Some(p) = try_get() {
-        p.set_fullscreen(v);
-    }
+static BROWSER_BRIDGE: OnceLock<&'static dyn BrowserBridge> = OnceLock::new();
+
+pub fn install_browser_bridge(b: Box<dyn BrowserBridge>) {
+    let leaked: &'static dyn BrowserBridge = Box::leak(b);
+    BROWSER_BRIDGE
+        .set(leaked)
+        .map_err(|_| ())
+        .expect("install_browser_bridge called twice");
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_platform_set_cursor(t: c_int) {
-    if let Some(p) = try_get() {
-        p.set_cursor(t);
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_platform_alloc_surface() -> *mut c_void {
-    match try_get() {
-        Some(p) => p.alloc_surface(),
-        None => std::ptr::null_mut(),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_platform_free_surface(s: *mut c_void) {
-    if s.is_null() {
-        return;
-    }
-    if let Some(p) = try_get() {
-        p.free_surface(s);
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_platform_restack(
-    ordered: *const *mut c_void,
-    n: usize,
-) {
-    if let Some(p) = try_get() {
-        p.restack(ordered, n);
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_platform_cef_ozone_platform() -> *const c_char {
-    match try_get() {
-        Some(p) => p.cef_ozone_platform(),
-        None => c"".as_ptr(),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_platform_set_shared_texture_unsupported() {
-    if let Some(p) = try_get() {
-        p.set_shared_texture_unsupported();
-    }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_platform_clear_clipboard_handler() {
-    if let Some(p) = try_get() {
-        p.clear_clipboard_handler();
-    }
+pub fn browser_bridge() -> Option<&'static dyn BrowserBridge> {
+    BROWSER_BRIDGE.get().copied()
 }

@@ -1,6 +1,14 @@
 //! Per-surface ops: alloc/free, software present, resize, visibility,
-//! restack, fade. Mirrors the per-surface block of the former
-//! `src/platform/x11.cpp`.
+//! restack, fade.
+//!
+//! # Safety
+//!
+//! `pub unsafe fn jfn_x11_*` entries take a `*mut PlatformSurface`
+//! returned by [`jfn_x11_alloc_surface`]; callers must pass either that
+//! handle or null, plus valid `JfnRect` / pixel-buffer pointers matching
+//! the declared dimensions.
+
+#![allow(clippy::missing_safety_doc)]
 
 use std::ffi::{c_int, c_void};
 use std::ptr;
@@ -13,9 +21,7 @@ use crate::x11_state::{MUT, Mutable, PlatformSurface, is_none_gc, is_none_window
 
 pub use jfn_platform_abi::JfnRect;
 
-unsafe extern "C" {
-    fn jfn_shutting_down() -> bool;
-}
+use jfn_playback::shutdown::jfn_shutting_down;
 
 /// Create an ARGB override-redirect overlay window at (x, y, w, h).
 /// Caller holds `MUT` and provides the mutable state borrow.
@@ -70,13 +76,12 @@ fn create_overlay_window(
     win
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_x11_alloc_surface() -> *mut PlatformSurface {
+pub fn jfn_x11_alloc_surface() -> *mut PlatformSurface {
     let s = Box::into_raw(Box::new(PlatformSurface::new()));
     let Some(conn) = crate::x11_state::conn() else {
         return s;
     };
-    let mut g = MUT.lock().unwrap();
+    let mut g = MUT.lock();
     let Some(m) = g.as_mut() else {
         return s;
     };
@@ -111,8 +116,7 @@ pub extern "C" fn jfn_x11_alloc_surface() -> *mut PlatformSurface {
     s
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_x11_free_surface(s: *mut PlatformSurface) {
+pub unsafe fn jfn_x11_free_surface(s: *mut PlatformSurface) {
     if s.is_null() {
         return;
     }
@@ -122,11 +126,11 @@ pub unsafe extern "C" fn jfn_x11_free_surface(s: *mut PlatformSurface) {
         return;
     };
     {
-        let mut g = MUT.lock().unwrap();
-        if let Some(m) = g.as_mut() {
-            if let Some(pos) = m.live.iter().position(|&p| p == s) {
-                m.live.swap_remove(pos);
-            }
+        let mut g = MUT.lock();
+        if let Some(m) = g.as_mut()
+            && let Some(pos) = m.live.iter().position(|&p| p == s)
+        {
+            m.live.swap_remove(pos);
         }
     }
 
@@ -135,29 +139,28 @@ pub unsafe extern "C" fn jfn_x11_free_surface(s: *mut PlatformSurface) {
         shm_free(buf, Some(&conn));
     }
     if !is_none_window(surf.window) {
-        conn.send_request(&x::UnmapWindow { window: surf.window });
+        conn.send_request(&x::UnmapWindow {
+            window: surf.window,
+        });
     }
     if !is_none_gc(surf.gc) {
         conn.send_request(&x::FreeGc { gc: surf.gc });
     }
     if !is_none_window(surf.window) {
-        conn.send_request(&x::DestroyWindow { window: surf.window });
+        conn.send_request(&x::DestroyWindow {
+            window: surf.window,
+        });
     }
     let _ = conn.flush();
     drop(unsafe { Box::from_raw(s) });
 }
 
 /// Accelerated present is not supported on the X11 backend.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_x11_surface_present(
-    _s: *mut PlatformSurface,
-    _info: *const c_void,
-) -> bool {
+pub fn jfn_x11_surface_present(_s: *mut PlatformSurface, _info: *const c_void) -> bool {
     false
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_x11_surface_present_software(
+pub unsafe fn jfn_x11_surface_present_software(
     s: *mut PlatformSurface,
     dirty: *const JfnRect,
     dirty_len: usize,
@@ -165,13 +168,13 @@ pub unsafe extern "C" fn jfn_x11_surface_present_software(
     w: c_int,
     h: c_int,
 ) -> bool {
-    if unsafe { jfn_shutting_down() } || s.is_null() || buffer.is_null() || w <= 0 || h <= 0 {
+    if jfn_shutting_down() || s.is_null() || buffer.is_null() || w <= 0 || h <= 0 {
         return false;
     }
     let Some(conn) = crate::x11_state::conn() else {
         return false;
     };
-    let mut g = MUT.lock().unwrap();
+    let mut g = MUT.lock();
     let Some(m) = g.as_mut() else {
         return false;
     };
@@ -248,8 +251,7 @@ pub unsafe extern "C" fn jfn_x11_surface_present_software(
     true
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_x11_surface_resize(
+pub unsafe fn jfn_x11_surface_resize(
     s: *mut PlatformSurface,
     _lw: c_int,
     _lh: c_int,
@@ -262,7 +264,7 @@ pub unsafe extern "C" fn jfn_x11_surface_resize(
     let Some(conn) = crate::x11_state::conn() else {
         return;
     };
-    let mut g = MUT.lock().unwrap();
+    let mut g = MUT.lock();
     let Some(m) = g.as_mut() else { return };
 
     m.pw = pw;
@@ -293,15 +295,14 @@ pub unsafe extern "C" fn jfn_x11_surface_resize(
     let _ = conn.flush();
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_x11_surface_set_visible(s: *mut PlatformSurface, visible: bool) {
+pub unsafe fn jfn_x11_surface_set_visible(s: *mut PlatformSurface, visible: bool) {
     if s.is_null() {
         return;
     }
     let Some(conn) = crate::x11_state::conn() else {
         return;
     };
-    let mut g = MUT.lock().unwrap();
+    let mut g = MUT.lock();
     let Some(m) = g.as_mut() else { return };
 
     let surf = unsafe { &mut *s };
@@ -338,26 +339,26 @@ pub unsafe extern "C" fn jfn_x11_surface_set_visible(s: *mut PlatformSurface, vi
                 x::ConfigWindow::Height(ph),
             ],
         });
-        conn.send_request(&x::MapWindow { window: surf.window });
+        conn.send_request(&x::MapWindow {
+            window: surf.window,
+        });
     } else {
-        conn.send_request(&x::UnmapWindow { window: surf.window });
+        conn.send_request(&x::UnmapWindow {
+            window: surf.window,
+        });
     }
     let _ = conn.flush();
 }
 
 /// Stack `ordered[0..n]` above the mpv parent, bottom to top.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_x11_restack(
-    ordered: *const *mut PlatformSurface,
-    n: usize,
-) {
+pub unsafe fn jfn_x11_restack(ordered: *const *mut PlatformSurface, n: usize) {
     if n == 0 || ordered.is_null() {
         return;
     }
     let Some(conn) = crate::x11_state::conn() else {
         return;
     };
-    let g = MUT.lock().unwrap();
+    let g = MUT.lock();
     let Some(m) = g.as_ref() else { return };
 
     let slice = unsafe { std::slice::from_raw_parts(ordered, n) };
@@ -387,16 +388,11 @@ pub unsafe extern "C" fn jfn_x11_restack(
 /// per-window opacity that survives across compositors, so we hard-unmap
 /// the X window as the visual side of the fade and fire the callback
 /// contract synchronously.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_x11_fade_surface(
+pub unsafe fn jfn_x11_fade_surface(
     s: *mut PlatformSurface,
     _fade_sec: f32,
-    on_start: Option<unsafe extern "C" fn(*mut c_void)>,
-    start_ctx: *mut c_void,
-    start_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-    on_done: Option<unsafe extern "C" fn(*mut c_void)>,
-    done_ctx: *mut c_void,
-    done_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+    on_start: Option<Box<dyn FnOnce() + Send>>,
+    on_done: Option<Box<dyn FnOnce() + Send>>,
 ) {
     // Visually hide the overlay window immediately. The CefLayer continues
     // to exist (the JS animation/teardown still runs); the X window just
@@ -405,16 +401,9 @@ pub unsafe extern "C" fn jfn_x11_fade_surface(
         unsafe { jfn_x11_surface_set_visible(s, false) };
     }
     if let Some(f) = on_start {
-        unsafe { f(start_ctx) };
-    }
-    if let Some(d) = start_dtor {
-        unsafe { d(start_ctx) };
+        f();
     }
     if let Some(f) = on_done {
-        unsafe { f(done_ctx) };
-    }
-    if let Some(d) = done_dtor {
-        unsafe { d(done_ctx) };
+        f();
     }
 }
-

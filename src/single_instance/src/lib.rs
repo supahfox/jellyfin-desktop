@@ -28,12 +28,16 @@ unsafe impl Sync for Callback {}
 mod imp {
     use super::Callback;
     use libc::{
-        AF_UNIX, ECONNREFUSED, ENOENT, POLLIN, SOCK_STREAM, c_char, c_int, c_void, close, getuid,
-        pipe, poll, pollfd, sockaddr_un,
+        AF_UNIX, ECONNREFUSED, ENOENT, POLLIN, SOCK_STREAM, c_char, c_int, c_void, close, pipe,
+        poll, pollfd, sockaddr_un,
     };
+    // Only the non-macOS socket path derives the filename from the uid; macOS
+    // uses TMPDIR instead.
+    #[cfg(not(target_os = "macos"))]
+    use libc::getuid;
+    use parking_lot::Mutex;
     use std::ffi::{CStr, CString};
     use std::path::PathBuf;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::thread::{self, JoinHandle};
 
@@ -228,7 +232,7 @@ mod imp {
         RUNNING.store(true, Ordering::Release);
 
         let handle = thread::spawn(move || listener_loop(cb));
-        *THREAD.lock().unwrap() = Some(handle);
+        *THREAD.lock() = Some(handle);
         true
     }
 
@@ -243,7 +247,7 @@ mod imp {
                 libc::write(wake_write, buf.as_ptr() as *const c_void, 1);
             }
         }
-        if let Some(h) = THREAD.lock().unwrap().take() {
+        if let Some(h) = THREAD.lock().take() {
             let _ = h.join();
         }
         let path = socket_path();
@@ -267,8 +271,8 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::Callback;
+    use parking_lot::Mutex;
     use std::ffi::CString;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread::{self, JoinHandle};
     use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
@@ -396,7 +400,7 @@ mod imp {
         SHUTDOWN_EVENT.store(event as usize, Ordering::Release);
         RUNNING.store(true, Ordering::Release);
         let handle = thread::spawn(move || listener_loop(cb));
-        *THREAD.lock().unwrap() = Some(handle);
+        *THREAD.lock() = Some(handle);
         true
     }
 
@@ -423,7 +427,7 @@ mod imp {
         if pipe != INVALID_HANDLE_VALUE {
             unsafe { CloseHandle(pipe) };
         }
-        if let Some(h) = THREAD.lock().unwrap().take() {
+        if let Some(h) = THREAD.lock().take() {
             let _ = h.join();
         }
         if !event.is_null() {
@@ -432,8 +436,7 @@ mod imp {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_single_instance_try_signal_existing() -> i32 {
+pub fn jfn_single_instance_try_signal_existing() -> i32 {
     imp::try_signal_existing() as i32
 }
 
@@ -441,8 +444,7 @@ pub extern "C" fn jfn_single_instance_try_signal_existing() -> i32 {
 /// `cb` must remain callable for the lifetime of the listener thread (i.e.
 /// until `jfn_single_instance_stop_listener` returns). `userdata` is opaque
 /// to Rust and passed back to `cb` unchanged.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_single_instance_start_listener(
+pub unsafe fn jfn_single_instance_start_listener(
     cb: Option<unsafe extern "C" fn(*const c_char, *mut c_void)>,
     userdata: *mut c_void,
 ) -> i32 {
@@ -450,7 +452,6 @@ pub unsafe extern "C" fn jfn_single_instance_start_listener(
     imp::start_listener(Callback { cb, userdata }) as i32
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_single_instance_stop_listener() {
+pub fn jfn_single_instance_stop_listener() {
     imp::stop_listener();
 }

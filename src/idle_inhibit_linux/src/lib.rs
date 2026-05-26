@@ -4,8 +4,10 @@
 //! inhibit lasts as long as the fd is open. Replacing the inhibit closes the
 //! previous fd, which atomically releases the prior inhibitor.
 
+#![cfg(target_os = "linux")]
+
+use parking_lot::Mutex;
 use std::os::fd::OwnedFd;
-use std::sync::Mutex;
 
 use zbus::blocking::Connection;
 use zbus::zvariant::OwnedFd as ZOwnedFd;
@@ -31,9 +33,8 @@ fn what_for(level: u32) -> Option<&'static str> {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_idle_inhibit_set(level: u32) {
-    let mut state = STATE.lock().unwrap();
+pub fn set(level: u32) {
+    let mut state = STATE.lock();
     state.fd = None;
     let Some(what) = what_for(level) else {
         return;
@@ -43,7 +44,7 @@ pub extern "C" fn jfn_idle_inhibit_set(level: u32) {
         match Connection::system() {
             Ok(c) => state.bus = Some(c),
             Err(e) => {
-                log::error!("idle_inhibit: system bus connect failed: {}", e);
+                tracing::error!("idle_inhibit: system bus connect failed: {}", e);
                 return;
             }
         }
@@ -60,15 +61,14 @@ pub extern "C" fn jfn_idle_inhibit_set(level: u32) {
     match reply {
         Ok(msg) => match msg.body().deserialize::<ZOwnedFd>() {
             Ok(fd) => state.fd = Some(fd.into()),
-            Err(e) => log::error!("idle_inhibit: Inhibit reply not fd: {}", e),
+            Err(e) => tracing::error!("idle_inhibit: Inhibit reply not fd: {}", e),
         },
-        Err(e) => log::error!("idle_inhibit: Inhibit call failed: {}", e),
+        Err(e) => tracing::error!("idle_inhibit: Inhibit call failed: {}", e),
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_idle_inhibit_cleanup() {
-    let mut state = STATE.lock().unwrap();
+pub fn cleanup() {
+    let mut state = STATE.lock();
     state.fd = None;
     state.bus = None;
 }

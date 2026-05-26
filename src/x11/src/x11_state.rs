@@ -1,11 +1,11 @@
 //! Shared X11 state: connection, atoms, ARGB visual, per-surface table.
 //!
-//! Mirrors the file-static state in the former `src/platform/x11.cpp`.
 //! Connection lives behind an `Arc` so the input thread can hold a
 //! reference independent of the global mutex. The mutex protects every
 //! mutable field including the `live` surface list.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::{Arc, OnceLock};
 
 use xcb::{Xid, XidNew, x};
 
@@ -54,6 +54,12 @@ pub struct PlatformSurface {
 }
 
 unsafe impl Send for PlatformSurface {}
+
+impl Default for PlatformSurface {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl PlatformSurface {
     pub fn new() -> Self {

@@ -9,18 +9,19 @@ pub mod browser_sink;
 mod coordinator;
 pub mod exec_js;
 pub mod ffi;
-mod hotkey;
-mod ingest;
+pub mod hotkey;
 pub mod idle_inhibit_sink;
+mod ingest;
 pub mod ingest_driver;
+#[cfg(target_os = "linux")]
 mod mpris;
 #[cfg(target_os = "linux")]
 pub mod mpris_sink;
-mod shutdown;
+pub mod shutdown;
 mod state_machine;
 pub mod theme_color_sink;
 mod types;
-mod wake_event;
+pub mod wake_event;
 
 pub use coordinator::PlaybackCoordinator;
 pub use ffi::*;

@@ -1,16 +1,9 @@
-//! Rust author of the Windows `Platform` vtable.
-//!
-//! Composition only — individual platform functions still live in
-//! `src/platform/windows.cpp` + `src/input/input_windows.cpp`. They are
-//! exposed with `extern "C"` linkage so this crate can populate the
-//! vtable from them by symbol name. Subsequent slices replace each
-//! thunk with a native Rust implementation; the C ABI at the vtable
-//! boundary stays stable.
+//! Windows `Platform` backend.
 
 #![cfg(target_os = "windows")]
 #![allow(non_snake_case)]
 
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use jfn_platform_abi::{DisplayBackend, JfnPopupRequest, JfnRect, Platform};
@@ -18,27 +11,25 @@ pub use jfn_platform_abi::{DisplayBackend, JfnPopupRequest, JfnRect, Platform};
 mod compositor;
 mod input;
 mod platform;
+pub use compositor::{
+    jfn_win_begin_transition_locked, jfn_win_cleanup_compositor, jfn_win_init_compositor,
+    jfn_win_update_surface_size, jfn_win_wndproc_begin_transition_locked,
+    jfn_win_wndproc_end_transition_locked, win_alloc_surface, win_end_transition, win_fade_surface,
+    win_free_surface, win_popup_hide, win_popup_present, win_popup_present_software,
+    win_popup_show, win_restack, win_set_expected_size, win_surface_present,
+    win_surface_present_software, win_surface_resize, win_surface_set_visible,
+};
 pub use input::{
     jfn_input_windows_resize_to_parent, jfn_input_windows_run_input_thread,
     jfn_input_windows_set_cursor, jfn_input_windows_stop_input_thread,
 };
-pub use compositor::{
-    jfn_win_begin_transition_locked, jfn_win_cleanup_compositor, jfn_win_init_compositor,
-    jfn_win_update_surface_size, jfn_win_wndproc_begin_transition_locked,
-    jfn_win_wndproc_end_transition_locked, win_alloc_surface, win_end_transition,
-    win_fade_surface, win_free_surface, win_popup_hide, win_popup_present,
-    win_popup_present_software, win_popup_show, win_restack, win_set_expected_size,
-    win_surface_present, win_surface_present_software, win_surface_resize,
-    win_surface_set_visible,
-};
 pub use platform::{
     jfn_win_get_hwnd, win_clamp_window_geometry, win_cleanup, win_early_init,
-    win_get_display_scale, win_get_scale, win_init, win_query_window_position,
-    win_set_fullscreen, win_toggle_fullscreen,
+    win_get_display_scale, win_get_scale, win_init, win_query_window_position, win_set_fullscreen,
+    win_toggle_fullscreen,
 };
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_pump() {
+pub fn win_pump() {
     // Input handled by dedicated input-thread message loop.
 }
 
@@ -63,9 +54,7 @@ unsafe extern "C" {
 // ref-counted cef_task_t whose execute() runs on TID_UI and self-deletes.
 // =====================================================================
 
-use cef_dll_sys::{
-    cef_base_ref_counted_t, cef_post_task, cef_task_t, cef_thread_id_t::TID_UI,
-};
+use cef_dll_sys::{cef_base_ref_counted_t, cef_post_task, cef_task_t, cef_thread_id_t::TID_UI};
 use std::sync::atomic::AtomicI32;
 
 #[repr(C)]
@@ -140,9 +129,8 @@ const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
 
 /// Tint the DWM titlebar so it matches the current theme color.
 /// rgb is 0x00RRGGBB; DWMWA_CAPTION_COLOR wants 0x00BBGGRR (COLORREF).
-#[unsafe(no_mangle)]
-pub extern "C" fn win_set_theme_color(rgb: u32) {
-    let hwnd = unsafe { jfn_win_get_hwnd() };
+pub fn win_set_theme_color(rgb: u32) {
+    let hwnd = jfn_win_get_hwnd();
     if hwnd.is_null() {
         return;
     }
@@ -162,8 +150,7 @@ pub extern "C" fn win_set_theme_color(rgb: u32) {
 
 /// Map IdleInhibitLevel (None=0, System=1, Display=2) to execution-state
 /// flags and post the call onto TID_UI so it lives on a stable thread.
-#[unsafe(no_mangle)]
-pub extern "C" fn win_set_idle_inhibit(level: c_int) {
+pub fn win_set_idle_inhibit(level: c_int) {
     let mut flags = ES_CONTINUOUS;
     match level {
         2 => flags |= ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED,
@@ -183,13 +170,11 @@ pub extern "C" fn win_set_idle_inhibit(level: c_int) {
 
 pub(crate) static G_TRANSITIONING: AtomicBool = AtomicBool::new(false);
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_begin_transition() {
+pub fn win_begin_transition() {
     jfn_win_begin_transition_locked();
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_in_transition() -> bool {
+pub fn win_in_transition() -> bool {
     G_TRANSITIONING.load(Ordering::SeqCst)
 }
 
@@ -237,12 +222,7 @@ unsafe extern "C" {
     ) -> *mut c_void;
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_clipboard_read_text_async(
-    on_done: Option<unsafe extern "C" fn(*mut c_void, *const c_char, usize)>,
-    ctx: *mut c_void,
-    dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-) {
+pub fn win_clipboard_read_text_async(on_done: Box<dyn FnOnce(&str) + Send>) {
     let mut result: Vec<u8> = Vec::new();
     unsafe {
         if OpenClipboard(std::ptr::null_mut()) != 0 {
@@ -280,22 +260,24 @@ pub extern "C" fn win_clipboard_read_text_async(
             CloseClipboard();
         }
     }
-    if let Some(cb) = on_done {
-        unsafe { cb(ctx, result.as_ptr() as *const c_char, result.len()) };
-    }
-    if let Some(d) = dtor {
-        unsafe { d(ctx) };
-    }
+    on_done(std::str::from_utf8(&result).unwrap_or(""));
 }
 
 /// Open an external URL via `ShellExecuteW(open)`.
-#[unsafe(no_mangle)]
-pub extern "C" fn win_open_external_url(utf8: *const c_char, len: usize) {
-    if utf8.is_null() || len == 0 {
+pub fn win_open_external_url(url: &str) {
+    if url.is_empty() {
         return;
     }
+    let bytes = url.as_bytes();
     let wlen = unsafe {
-        MultiByteToWideChar(CP_UTF8, 0, utf8 as *const u8, len as c_int, std::ptr::null_mut(), 0)
+        MultiByteToWideChar(
+            CP_UTF8,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as c_int,
+            std::ptr::null_mut(),
+            0,
+        )
     };
     if wlen <= 0 {
         return;
@@ -305,8 +287,8 @@ pub extern "C" fn win_open_external_url(utf8: *const c_char, len: usize) {
         MultiByteToWideChar(
             CP_UTF8,
             0,
-            utf8 as *const u8,
-            len as c_int,
+            bytes.as_ptr(),
+            bytes.len() as c_int,
             wurl.as_mut_ptr(),
             wlen,
         );
@@ -375,14 +357,7 @@ impl Platform for WindowsPlatform {
         win_surface_present_software(s, _dirty, _dirty_len, _buffer, _w, _h)
     }
 
-    fn surface_resize(
-        &self,
-        s: SurfaceHandle,
-        lw: c_int,
-        lh: c_int,
-        pw: c_int,
-        ph: c_int,
-    ) {
+    fn surface_resize(&self, s: SurfaceHandle, lw: c_int, lh: c_int, pw: c_int, ph: c_int) {
         win_surface_resize(s, lw, lh, pw, ph);
     }
 
@@ -398,31 +373,22 @@ impl Platform for WindowsPlatform {
         &self,
         s: SurfaceHandle,
         sec: f32,
-        on_start: Option<unsafe extern "C" fn(*mut c_void)>,
-        start_ctx: *mut c_void,
-        start_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-        on_done: Option<unsafe extern "C" fn(*mut c_void)>,
-        done_ctx: *mut c_void,
-        done_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+        on_start: Option<Box<dyn FnOnce() + Send>>,
+        on_done: Option<Box<dyn FnOnce() + Send>>,
     ) {
-        win_fade_surface(s, sec, on_start, start_ctx, start_dtor, on_done, done_ctx, done_dtor);
+        win_fade_surface(s, sec, on_start, on_done);
     }
 
-    fn popup_show(&self, s: SurfaceHandle, req: *const JfnPopupRequest) {
-        win_popup_show(s, req);
+    fn popup_show(&self, s: SurfaceHandle, req: JfnPopupRequest) {
+        win_popup_show(s, req.x, req.y);
+        // CEF dispatches selection itself on Windows; drop the closure.
     }
 
     fn popup_hide(&self, s: SurfaceHandle) {
         win_popup_hide(s);
     }
 
-    fn popup_present(
-        &self,
-        s: SurfaceHandle,
-        info: *const c_void,
-        lw: c_int,
-        lh: c_int,
-    ) {
+    fn popup_present(&self, s: SurfaceHandle, info: *const c_void, lw: c_int, lh: c_int) {
         win_popup_present(s, info, lw, lh);
     }
 
@@ -470,17 +436,11 @@ impl Platform for WindowsPlatform {
         win_get_display_scale(x, y)
     }
 
-    fn query_window_position(&self, x: *mut c_int, y: *mut c_int) -> bool {
+    fn query_window_position(&self, x: &mut c_int, y: &mut c_int) -> bool {
         win_query_window_position(x, y)
     }
 
-    fn clamp_window_geometry(
-        &self,
-        w: *mut c_int,
-        h: *mut c_int,
-        x: *mut c_int,
-        y: *mut c_int,
-    ) {
+    fn clamp_window_geometry(&self, w: &mut c_int, h: &mut c_int, x: &mut c_int, y: &mut c_int) {
         win_clamp_window_geometry(w, h, x, y);
     }
 
@@ -500,17 +460,12 @@ impl Platform for WindowsPlatform {
         win_set_theme_color(rgb);
     }
 
-    fn clipboard_read_text_async(
-        &self,
-        on_done: Option<unsafe extern "C" fn(*mut c_void, *const c_char, usize)>,
-        ctx: *mut c_void,
-        dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-    ) {
-        win_clipboard_read_text_async(on_done, ctx, dtor);
+    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(&str) + Send>) {
+        win_clipboard_read_text_async(on_done);
     }
 
-    fn open_external_url(&self, utf8: *const c_char, len: usize) {
-        win_open_external_url(utf8, len);
+    fn open_external_url(&self, url: &str) {
+        win_open_external_url(url);
     }
 }
 

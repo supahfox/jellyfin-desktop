@@ -1,11 +1,10 @@
 //! Browser playback sink. Forwards UI-affecting events to the embedded
-//! web view via the exec_js callback the C++ side installs. Reads only
+//! web view via the exec_js callback installed at boot. Reads only
 //! from the event snapshot.
-//!
-//! Replaces `src/playback/sinks/browser_sink.cpp`.
 
+use parking_lot::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use serde_json::json;
 
@@ -31,15 +30,13 @@ fn slot() -> &'static Mutex<Handlers> {
 }
 
 /// Install / clear the browsers.setSize handler.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_playback_set_browsers_size_handler(cb: Option<SetSizeCb>) {
-    slot().lock().unwrap().set_size = cb;
+pub fn jfn_playback_set_browsers_size_handler(cb: Option<SetSizeCb>) {
+    slot().lock().set_size = cb;
 }
 
 /// Install / clear the browsers.setRefreshRate handler.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_playback_set_browsers_refresh_rate_handler(cb: Option<SetHzCb>) {
-    slot().lock().unwrap().set_hz = cb;
+pub fn jfn_playback_set_browsers_refresh_rate_handler(cb: Option<SetHzCb>) {
+    slot().lock().set_hz = cb;
 }
 
 // Mirrors maximized-before-fullscreen state so the geometry-save tail in
@@ -47,8 +44,7 @@ pub extern "C" fn jfn_playback_set_browsers_refresh_rate_handler(cb: Option<SetH
 static WAS_MAXIMIZED: AtomicBool = AtomicBool::new(false);
 
 /// Geometry-save tail reads this at shutdown.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_playback_was_maximized_before_fullscreen() -> bool {
+pub fn jfn_playback_was_maximized_before_fullscreen() -> bool {
     WAS_MAXIMIZED.load(Ordering::Relaxed)
 }
 
@@ -102,12 +98,12 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
             ));
         }
         PlaybackEventKind::OsdDimsChanged => {
-            if let Some(cb) = slot().lock().unwrap().set_size {
+            if let Some(cb) = slot().lock().set_size {
                 cb(snap.layout_w, snap.layout_h, snap.pixel_w, snap.pixel_h);
             }
         }
         PlaybackEventKind::DisplayHzChanged => {
-            if let Some(cb) = slot().lock().unwrap().set_hz {
+            if let Some(cb) = slot().lock().set_hz {
                 cb(snap.display_hz);
             }
         }
@@ -118,10 +114,7 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
                 .map(|r| json!({ "start": r.start_ticks, "end": r.end_ticks }))
                 .collect();
             let json_str = serde_json::Value::Array(arr).to_string();
-            call_exec_js(&format!(
-                "window._nativeUpdateBufferedRanges({})",
-                json_str
-            ));
+            call_exec_js(&format!("window._nativeUpdateBufferedRanges({})", json_str));
         }
         PlaybackEventKind::BufferingChanged
         | PlaybackEventKind::MediaTypeChanged
@@ -133,4 +126,3 @@ pub(crate) fn deliver(ev: &PlaybackEvent) {
         }
     }
 }
-

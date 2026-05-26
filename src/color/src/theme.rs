@@ -1,4 +1,4 @@
-//! Window-scoped theme color tracker. Ports `src/theme_color.h`.
+//! Window-scoped theme color tracker.
 //!
 //! Owns the current theme-color (`<meta name="theme-color">` updates),
 //! buffers it until the loading overlay dismisses, and switches to the
@@ -11,8 +11,8 @@
 //!   * `on_set_bg_hex(c_str)` — required; passes `#RRGGBB` to mpv so its
 //!     background matches the chrome during resize.
 
+use parking_lot::Mutex;
 use std::ffi::c_char;
-use std::sync::Mutex;
 
 const DEFAULT_BG_RGB: u32 = 0x101010; // kBgColor
 
@@ -54,7 +54,11 @@ fn format_hex_rgb(rgb: u32, out: &mut [u8; 8]) {
     out[0] = b'#';
     for i in 0..6 {
         let nibble = ((rgb >> (20 - i * 4)) & 0xF) as u8;
-        out[1 + i] = if nibble < 10 { b'0' + nibble } else { b'a' + (nibble - 10) };
+        out[1 + i] = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + (nibble - 10)
+        };
     }
     out[7] = 0;
 }
@@ -67,8 +71,7 @@ static INSTANCE: Mutex<Option<ThemeColor>> = Mutex::new(None);
 ///
 /// # Safety
 /// Callbacks must be valid for the lifetime of the process.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_theme_color_init(
+pub unsafe fn jfn_theme_color_init(
     on_set_theme_color: Option<unsafe extern "C" fn(u32)>,
     on_set_bg_hex: Option<unsafe extern "C" fn(*const c_char)>,
 ) {
@@ -85,12 +88,11 @@ pub unsafe extern "C" fn jfn_theme_color_init(
         last_applied: None,
     };
     tc.apply();
-    *INSTANCE.lock().unwrap() = Some(tc);
+    *INSTANCE.lock() = Some(tc);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_theme_color_set_video_bg(rgb: u32) {
-    let mut g = INSTANCE.lock().unwrap();
+pub fn jfn_theme_color_set_video_bg(rgb: u32) {
+    let mut g = INSTANCE.lock();
     if let Some(t) = g.as_mut() {
         t.video_bg_rgb = rgb;
         if t.video_active && t.unlocked {
@@ -99,9 +101,8 @@ pub extern "C" fn jfn_theme_color_set_video_bg(rgb: u32) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_theme_color_on_color(rgb: u32) {
-    let mut g = INSTANCE.lock().unwrap();
+pub fn jfn_theme_color_on_color(rgb: u32) {
+    let mut g = INSTANCE.lock();
     if let Some(t) = g.as_mut() {
         t.current_rgb = rgb;
         if t.unlocked {
@@ -110,18 +111,16 @@ pub extern "C" fn jfn_theme_color_on_color(rgb: u32) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_theme_color_on_overlay_dismissed() {
-    let mut g = INSTANCE.lock().unwrap();
+pub fn jfn_theme_color_on_overlay_dismissed() {
+    let mut g = INSTANCE.lock();
     if let Some(t) = g.as_mut() {
         t.unlocked = true;
         t.apply();
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_theme_color_set_video_mode(active: bool) {
-    let mut g = INSTANCE.lock().unwrap();
+pub fn jfn_theme_color_set_video_mode(active: bool) {
+    let mut g = INSTANCE.lock();
     if let Some(t) = g.as_mut() {
         if t.video_active == active {
             return;
@@ -133,9 +132,8 @@ pub extern "C" fn jfn_theme_color_set_video_mode(active: bool) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_theme_color_shutdown() {
-    *INSTANCE.lock().unwrap() = None;
+pub fn jfn_theme_color_shutdown() {
+    *INSTANCE.lock() = None;
 }
 
 #[cfg(test)]

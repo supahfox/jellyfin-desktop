@@ -1,36 +1,33 @@
-//! Lifecycle wrapper around the Rust Wayland input thread.
+// lifecycle_init forwards a wl_display* the app already owns to the
+// unsafe input thread init; the function exists for callers that don't
+// want to mark themselves unsafe just to pass a pointer through.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+//! Lifecycle wrapper around the Wayland input thread.
 //!
 //! Owns the static `JfnInputWayland` handle, builds the input thread's
-//! `Callbacks` struct from `extern "C"` dispatch shims defined in
-//! `src/input/dispatch.cpp`, and exposes the Platform-vtable cursor setter.
-//!
-//! Replaces the former `src/input/input_wayland.cpp` glue file.
+//! `Callbacks` struct from the input crate's dispatch shims, and exposes
+//! the Platform-vtable cursor setter.
 
-use std::ffi::{c_int, c_void};
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::input::{Callbacks, JfnInputWayland};
 
-unsafe extern "C" {
-    fn jfn_input_dispatch_mouse_move(x: i32, y: i32, mods: u32, leave: c_int);
-    fn jfn_input_dispatch_mouse_button(
-        button: u32, pressed: c_int, x: i32, y: i32, mods: u32,
-    );
-    fn jfn_input_dispatch_scroll(x: i32, y: i32, dx: i32, dy: i32, mods: u32);
-    fn jfn_input_dispatch_history_nav(forward: c_int);
-    fn jfn_input_dispatch_keyboard_focus(gained: c_int);
-    fn jfn_input_dispatch_key_raw(keysym: u32, native_code: u32, mods: u32, pressed: c_int);
-    fn jfn_input_dispatch_char(codepoint: u32, mods: u32, native_code: u32);
-}
+use jfn_input::{
+    jfn_input_dispatch_char, jfn_input_dispatch_history_nav, jfn_input_dispatch_key_raw,
+    jfn_input_dispatch_keyboard_focus, jfn_input_dispatch_mouse_button,
+    jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll,
+};
 
 const CALLBACKS: Callbacks = Callbacks {
-    mouse_move:   Some(jfn_input_dispatch_mouse_move),
+    mouse_move: Some(jfn_input_dispatch_mouse_move),
     mouse_button: Some(jfn_input_dispatch_mouse_button),
-    scroll:       Some(jfn_input_dispatch_scroll),
-    history_nav:  Some(jfn_input_dispatch_history_nav),
-    kb_focus:     Some(jfn_input_dispatch_keyboard_focus),
-    key:          Some(jfn_input_dispatch_key_raw),
-    char_:        Some(jfn_input_dispatch_char),
+    scroll: Some(jfn_input_dispatch_scroll),
+    history_nav: Some(jfn_input_dispatch_history_nav),
+    kb_focus: Some(jfn_input_dispatch_keyboard_focus),
+    key: Some(jfn_input_dispatch_key_raw),
+    char_: Some(jfn_input_dispatch_char),
 };
 
 static G_CTX: AtomicPtr<JfnInputWayland> = AtomicPtr::new(std::ptr::null_mut());

@@ -1,24 +1,32 @@
-//! C ABI exposing the post-init mpv handle to C++ — replaces the
-//! legacy `MpvHandle` wrapper class in `src/mpv/handle.h`.
+//! Post-init mpv handle accessors used by sibling crates.
 //!
 //! All entry points borrow the global handle published by
 //! [`crate::boot::jfn_mpv_handle_init`]. They no-op silently if the
 //! handle has not yet been initialized or has already been terminated.
 //!
 //! Property writes and commands go through libmpv's async API
-//! (`reply_userdata == 0`, fire-and-forget) — matching the legacy
-//! wrapper's `*Async` methods. Property reads are synchronous and must
-//! only be issued from non-event contexts; observed properties should
-//! be read from the `jfn_playback_*` atomics instead.
+//! (`reply_userdata == 0`, fire-and-forget). Property reads are
+//! synchronous and must only be issued from non-event contexts; observed
+//! properties should be read from the `jfn_playback_*` atomics instead.
 //!
 //! Stateful helpers — `LoadFile` / `ApplyPendingTrackSelectionAndPlay`
 //! / `SetAspectMode` — live here too. The pending-track state is
-//! single-threaded by usage but guarded by a Mutex so the FFI is safe
-//! to invoke from any thread.
+//! single-threaded by usage but guarded by a Mutex so callers from any
+//! thread stay safe.
+//!
+//! # Safety
+//!
+//! Every `pub unsafe fn` in this module accepts raw C-string / raw struct
+//! pointers preserved from the original FFI surface. Callers must ensure
+//! all `*const c_char` arguments point to NUL-terminated UTF-8 (or are
+//! null where the function documents tolerance), and that struct
+//! pointers reference live values for the duration of the call.
 
+#![allow(clippy::missing_safety_doc)]
+
+use parking_lot::Mutex;
 use std::ffi::{CStr, CString, c_char};
 use std::os::raw::c_void;
-use std::sync::Mutex;
 
 use crate::sys;
 
@@ -31,7 +39,11 @@ fn raw() -> *mut sys::mpv_handle {
 }
 
 unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a CStr> {
-    if p.is_null() { None } else { Some(unsafe { CStr::from_ptr(p) }) }
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { CStr::from_ptr(p) })
+    }
 }
 
 // =============================================================================
@@ -40,64 +52,83 @@ unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a CStr> {
 
 /// Async (`reply_userdata == 0`) flag write. No-op if the handle is
 /// missing or `name` is NULL.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_set_property_flag_async(name: *const c_char, value: bool) {
+pub unsafe fn jfn_mpv_set_property_flag_async(name: *const c_char, value: bool) {
     let h = raw();
-    if h.is_null() { return; }
-    let Some(n) = (unsafe { cstr(name) }) else { return };
+    if h.is_null() {
+        return;
+    }
+    let Some(n) = (unsafe { cstr(name) }) else {
+        return;
+    };
     let mut flag: i32 = if value { 1 } else { 0 };
     unsafe {
         sys::mpv_set_property_async(
-            h, 0, n.as_ptr(),
+            h,
+            0,
+            n.as_ptr(),
             sys::mpv_format::MPV_FORMAT_FLAG,
             &mut flag as *mut _ as *mut c_void,
         );
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_set_property_double_async(name: *const c_char, value: f64) {
+pub unsafe fn jfn_mpv_set_property_double_async(name: *const c_char, value: f64) {
     let h = raw();
-    if h.is_null() { return; }
-    let Some(n) = (unsafe { cstr(name) }) else { return };
+    if h.is_null() {
+        return;
+    }
+    let Some(n) = (unsafe { cstr(name) }) else {
+        return;
+    };
     let mut v = value;
     unsafe {
         sys::mpv_set_property_async(
-            h, 0, n.as_ptr(),
+            h,
+            0,
+            n.as_ptr(),
             sys::mpv_format::MPV_FORMAT_DOUBLE,
             &mut v as *mut _ as *mut c_void,
         );
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_set_property_int_async(name: *const c_char, value: i64) {
+pub unsafe fn jfn_mpv_set_property_int_async(name: *const c_char, value: i64) {
     let h = raw();
-    if h.is_null() { return; }
-    let Some(n) = (unsafe { cstr(name) }) else { return };
+    if h.is_null() {
+        return;
+    }
+    let Some(n) = (unsafe { cstr(name) }) else {
+        return;
+    };
     let mut v = value;
     unsafe {
         sys::mpv_set_property_async(
-            h, 0, n.as_ptr(),
+            h,
+            0,
+            n.as_ptr(),
             sys::mpv_format::MPV_FORMAT_INT64,
             &mut v as *mut _ as *mut c_void,
         );
     }
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_set_property_string_async(
-    name: *const c_char,
-    value: *const c_char,
-) {
+pub unsafe fn jfn_mpv_set_property_string_async(name: *const c_char, value: *const c_char) {
     let h = raw();
-    if h.is_null() { return; }
-    let Some(n) = (unsafe { cstr(name) }) else { return };
-    let Some(v) = (unsafe { cstr(value) }) else { return };
+    if h.is_null() {
+        return;
+    }
+    let Some(n) = (unsafe { cstr(name) }) else {
+        return;
+    };
+    let Some(v) = (unsafe { cstr(value) }) else {
+        return;
+    };
     let mut ptr = v.as_ptr();
     unsafe {
         sys::mpv_set_property_async(
-            h, 0, n.as_ptr(),
+            h,
+            0,
+            n.as_ptr(),
             sys::mpv_format::MPV_FORMAT_STRING,
             &mut ptr as *mut _ as *mut c_void,
         );
@@ -107,17 +138,18 @@ pub unsafe extern "C" fn jfn_mpv_set_property_string_async(
 /// Sync int property read. Writes the value into `*out` and returns
 /// libmpv's error code (0 on success, negative on failure). NULL `out`
 /// or missing handle returns `MPV_ERROR_INVALID_PARAMETER` (-4).
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_get_property_int(
-    name: *const c_char,
-    out: *mut i64,
-) -> i32 {
+pub unsafe fn jfn_mpv_get_property_int(name: *const c_char, out: *mut i64) -> i32 {
     let h = raw();
-    if h.is_null() || out.is_null() { return -4; }
-    let Some(n) = (unsafe { cstr(name) }) else { return -4 };
+    if h.is_null() || out.is_null() {
+        return -4;
+    }
+    let Some(n) = (unsafe { cstr(name) }) else {
+        return -4;
+    };
     unsafe {
         sys::mpv_get_property(
-            h, n.as_ptr(),
+            h,
+            n.as_ptr(),
             sys::mpv_format::MPV_FORMAT_INT64,
             out as *mut c_void,
         )
@@ -126,11 +158,14 @@ pub unsafe extern "C" fn jfn_mpv_get_property_int(
 
 /// Sync string property read. Returns a malloc'd UTF-8 C string the
 /// caller must free with [`jfn_mpv_free_string`], or NULL on failure.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_get_property_string(name: *const c_char) -> *mut c_char {
+pub unsafe fn jfn_mpv_get_property_string(name: *const c_char) -> *mut c_char {
     let h = raw();
-    if h.is_null() { return std::ptr::null_mut(); }
-    let Some(n) = (unsafe { cstr(name) }) else { return std::ptr::null_mut() };
+    if h.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(n) = (unsafe { cstr(name) }) else {
+        return std::ptr::null_mut();
+    };
     let p = unsafe { sys::mpv_get_property_string(h, n.as_ptr()) };
     if p.is_null() {
         return std::ptr::null_mut();
@@ -142,8 +177,7 @@ pub unsafe extern "C" fn jfn_mpv_get_property_string(name: *const c_char) -> *mu
     out.into_raw()
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_free_string(s: *mut c_char) {
+pub unsafe fn jfn_mpv_free_string(s: *mut c_char) {
     if !s.is_null() {
         drop(unsafe { CString::from_raw(s) });
     }
@@ -152,33 +186,36 @@ pub unsafe extern "C" fn jfn_mpv_free_string(s: *mut c_char) {
 /// Async command. `args` is a `const char* const*` table of length `n`
 /// (no NULL terminator required — the wrapper appends one). No-op on
 /// missing handle, empty argv, or NULL entries.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_command_async(args: *const *const c_char, n: usize) {
+pub unsafe fn jfn_mpv_command_async(args: *const *const c_char, n: usize) {
     let h = raw();
-    if h.is_null() || args.is_null() || n == 0 { return; }
+    if h.is_null() || args.is_null() || n == 0 {
+        return;
+    }
     let slice = unsafe { std::slice::from_raw_parts(args, n) };
-    if slice.iter().any(|p| p.is_null()) { return; }
+    if slice.iter().any(|p| p.is_null()) {
+        return;
+    }
     let mut argv: Vec<*const c_char> = slice.to_vec();
     argv.push(std::ptr::null());
     unsafe { sys::mpv_command_async(h, 0, argv.as_ptr() as *mut _) };
 }
 
 // =============================================================================
-// Event drain (wait_event / wakeup) — exposed for the C++ main loop.
+// Event drain (wait_event / wakeup).
 // =============================================================================
 
 /// Pumps libmpv's event queue. Returns the raw `mpv_event*` libmpv owns;
 /// valid only until the next call on the same handle. NULL if the handle
 /// is missing.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_wait_event(timeout: f64) -> *mut sys::mpv_event {
+pub fn jfn_mpv_wait_event(timeout: f64) -> *mut sys::mpv_event {
     let h = raw();
-    if h.is_null() { return std::ptr::null_mut(); }
+    if h.is_null() {
+        return std::ptr::null_mut();
+    }
     unsafe { sys::mpv_wait_event(h, timeout) }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_wakeup() {
+pub fn jfn_mpv_wakeup() {
     let h = raw();
     if !h.is_null() {
         unsafe { sys::mpv_wakeup(h) };
@@ -203,31 +240,40 @@ fn cmd(args: &[&CStr]) {
     unsafe { jfn_mpv_command_async(ptrs.as_ptr(), ptrs.len()) };
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_play()        { unsafe { set_flag(c"pause", false) }; }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_pause()       { unsafe { set_flag(c"pause", true) }; }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_toggle_pause() { cmd(&[c"cycle", c"pause"]); }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_stop()         { cmd(&[c"stop"]); }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_seek_absolute(secs: f64) {
+pub fn jfn_mpv_play() {
+    unsafe { set_flag(c"pause", false) };
+}
+pub fn jfn_mpv_pause() {
+    unsafe { set_flag(c"pause", true) };
+}
+pub fn jfn_mpv_toggle_pause() {
+    cmd(&[c"cycle", c"pause"]);
+}
+pub fn jfn_mpv_stop() {
+    cmd(&[c"stop"]);
+}
+pub fn jfn_mpv_seek_absolute(secs: f64) {
     let s = CString::new(format!("{}", secs)).unwrap();
     cmd(&[c"seek", &s, c"absolute"]);
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_set_volume(v: f64) { unsafe { set_double(c"volume", v) }; }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_set_muted(v: bool) { unsafe { set_flag(c"mute", v) }; }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_set_speed(v: f64) { unsafe { set_double(c"speed", v) }; }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_set_audio_delay(s: f64) { unsafe { set_double(c"audio-delay", s) }; }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_set_subtitle_delay(s: f64) { unsafe { set_double(c"sub-delay", s) }; }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_set_start_position(s: f64) { unsafe { set_double(c"start", s) }; }
+pub fn jfn_mpv_set_volume(v: f64) {
+    unsafe { set_double(c"volume", v) };
+}
+pub fn jfn_mpv_set_muted(v: bool) {
+    unsafe { set_flag(c"mute", v) };
+}
+pub fn jfn_mpv_set_speed(v: f64) {
+    unsafe { set_double(c"speed", v) };
+}
+pub fn jfn_mpv_set_audio_delay(s: f64) {
+    unsafe { set_double(c"audio-delay", s) };
+}
+pub fn jfn_mpv_set_subtitle_delay(s: f64) {
+    unsafe { set_double(c"sub-delay", s) };
+}
+pub fn jfn_mpv_set_start_position(s: f64) {
+    unsafe { set_double(c"start", s) };
+}
 
 /// Track id sentinel: 0 = disabled. >=1 = explicit mpv track id.
 /// Mpv's auto-track-selection is globally disabled (boot applies
@@ -242,27 +288,27 @@ fn track_to_mpv_str(id: i64) -> CString {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_set_audio_track(id: i64) {
+pub fn jfn_mpv_set_audio_track(id: i64) {
     let s = track_to_mpv_str(id);
     unsafe { set_str(c"aid", &s) };
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_set_subtitle_track(id: i64) {
+pub fn jfn_mpv_set_subtitle_track(id: i64) {
     let s = track_to_mpv_str(id);
     unsafe { set_str(c"sid", &s) };
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_sub_add(url: *const c_char) {
-    let Some(u) = (unsafe { cstr(url) }) else { return };
+pub unsafe fn jfn_mpv_sub_add(url: *const c_char) {
+    let Some(u) = (unsafe { cstr(url) }) else {
+        return;
+    };
     cmd(&[c"sub-add", u, c"select"]);
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_audio_add(url: *const c_char) {
-    let Some(u) = (unsafe { cstr(url) }) else { return };
+pub unsafe fn jfn_mpv_audio_add(url: *const c_char) {
+    let Some(u) = (unsafe { cstr(url) }) else {
+        return;
+    };
     cmd(&[c"audio-add", u, c"select"]);
 }
 
@@ -270,8 +316,7 @@ pub unsafe extern "C" fn jfn_mpv_audio_add(url: *const c_char) {
 // LoadFile + deferred track selection (stateful)
 // =============================================================================
 
-/// Mirrors the C++ `MpvHandle::LoadOptions`. NULL string pointers are
-/// treated as empty.
+/// Load options for `LoadFile`. NULL string pointers are treated as empty.
 #[repr(C)]
 pub struct JfnMpvLoadOptions {
     pub start_secs: f64,
@@ -315,19 +360,18 @@ unsafe fn cstr_to_string(p: *const c_char) -> String {
         .unwrap_or_default()
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_load_file(
-    path: *const c_char,
-    opts: *const JfnMpvLoadOptions,
-) {
-    let Some(path_c) = (unsafe { cstr(path) }) else { return };
-    let Some(o) = (unsafe { opts.as_ref() }) else { return };
+pub unsafe fn jfn_mpv_load_file(path: *const c_char, opts: *const JfnMpvLoadOptions) {
+    let Some(path_c) = (unsafe { cstr(path) }) else {
+        return;
+    };
+    let Some(o) = (unsafe { opts.as_ref() }) else {
+        return;
+    };
 
     let ext_audio = unsafe { cstr_to_string(o.external_audio_url) };
     let ext_sub = unsafe { cstr_to_string(o.external_sub_url) };
-    let defer_audio = o.is_infinite_stream
-        && o.audio_track == TRACK_DISABLE
-        && ext_audio.is_empty();
+    let defer_audio =
+        o.is_infinite_stream && o.audio_track == TRACK_DISABLE && ext_audio.is_empty();
 
     // Track selection is owned by Jellyfin. With track-auto-selection=no,
     // mpv silently drops aid/vid/sid in loadfile options (loadfile.c
@@ -337,7 +381,7 @@ pub unsafe extern "C" fn jfn_mpv_load_file(
     // FIFO-ordered on mpv's core thread, so playback only begins after
     // track-switch reinits land.
     {
-        let mut s = pending_slot().lock().unwrap();
+        let mut s = pending_slot().lock();
         s.vid = o.video_track;
         s.aid = o.audio_track;
         s.sid = o.sub_track;
@@ -358,11 +402,12 @@ pub unsafe extern "C" fn jfn_mpv_load_file(
     cmd(&[c"loadfile", path_c, c"replace", c"-1", &opts_c]);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_apply_pending_track_selection_and_play() {
+pub fn jfn_mpv_apply_pending_track_selection_and_play() {
     let snapshot = {
-        let mut s = pending_slot().lock().unwrap();
-        if !s.valid { return; }
+        let mut s = pending_slot().lock();
+        if !s.valid {
+            return;
+        }
         let snap = (
             s.vid,
             s.aid,
@@ -403,9 +448,10 @@ pub extern "C" fn jfn_mpv_apply_pending_track_selection_and_play() {
 // Aspect-mode helper
 // =============================================================================
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_set_aspect_mode(mode: *const c_char) {
-    let Some(m) = (unsafe { cstr(mode) }) else { return };
+pub unsafe fn jfn_mpv_set_aspect_mode(mode: *const c_char) {
+    let Some(m) = (unsafe { cstr(mode) }) else {
+        return;
+    };
     let (keepaspect, panscan) = match m.to_bytes() {
         b"auto" => (true, 0.0),
         b"cover" => (true, 1.0),
@@ -423,43 +469,45 @@ pub unsafe extern "C" fn jfn_mpv_set_aspect_mode(mode: *const c_char) {
 // Window / display
 // =============================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_set_fullscreen(v: bool) { unsafe { set_flag(c"fullscreen", v) }; }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_toggle_fullscreen() { cmd(&[c"cycle", c"fullscreen"]); }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_set_window_minimized(v: bool) {
+pub fn jfn_mpv_set_fullscreen(v: bool) {
+    unsafe { set_flag(c"fullscreen", v) };
+}
+pub fn jfn_mpv_toggle_fullscreen() {
+    cmd(&[c"cycle", c"fullscreen"]);
+}
+pub fn jfn_mpv_set_window_minimized(v: bool) {
     unsafe { set_flag(c"window-minimized", v) };
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_set_window_maximized(v: bool) {
+pub fn jfn_mpv_set_window_maximized(v: bool) {
     unsafe { set_flag(c"window-maximized", v) };
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_set_force_window_position(v: bool) {
+pub fn jfn_mpv_set_force_window_position(v: bool) {
     unsafe { set_flag(c"force-window-position", v) };
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_set_geometry(g: *const c_char) {
-    let Some(g) = (unsafe { cstr(g) }) else { return };
+pub unsafe fn jfn_mpv_set_geometry(g: *const c_char) {
+    let Some(g) = (unsafe { cstr(g) }) else {
+        return;
+    };
     unsafe { set_str(c"geometry", g) };
 }
 
 /// Returns the parsed packed RGB color of mpv's `background-color`
 /// property (0x00RRGGBB), or 0 if the property is unavailable or
 /// malformed.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_mpv_get_background_color() -> u32 {
+pub fn jfn_mpv_get_background_color() -> u32 {
     let p = unsafe { jfn_mpv_get_property_string(c"background-color".as_ptr()) };
-    if p.is_null() { return 0; }
+    if p.is_null() {
+        return 0;
+    }
     let s = unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
     let rgb = crate::color::parse(&s);
     unsafe { jfn_mpv_free_string(p) };
     rgb
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_mpv_set_background_color_hex(hex: *const c_char) {
-    let Some(h) = (unsafe { cstr(hex) }) else { return };
+pub unsafe fn jfn_mpv_set_background_color_hex(hex: *const c_char) {
+    let Some(h) = (unsafe { cstr(hex) }) else {
+        return;
+    };
     unsafe { set_str(c"background-color", h) };
 }

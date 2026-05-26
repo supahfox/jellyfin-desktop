@@ -1,24 +1,21 @@
-//! Native Rust port of the Windows-side platform vtable functions
-//! previously in `src/platform/windows.cpp`: window init/cleanup,
-//! fullscreen toggle helpers, scale + geometry queries, and the WndProc
-//! hook that drives compositor resize + transition bookkeeping.
+//! Windows platform impl: window init/cleanup, fullscreen toggle
+//! helpers, scale + geometry queries, and the WndProc hook that drives
+//! compositor resize + transition bookkeeping.
 //!
 //! All `g_win` state (HWND, cached scale, fullscreen bookkeeping, the
 //! WndProc hook handle, the input thread JoinHandle) lives in this
-//! module behind a `Mutex<WinState>`. C++ holds nothing Windows-specific
-//! anymore (apart from the SetThreadExecutionState bouncer which needs
-//! CefTask).
+//! module behind a `Mutex<WinState>`.
 
 #![allow(non_snake_case)]
 
+use parking_lot::Mutex;
 use std::ffi::{c_int, c_void};
-use std::sync::Mutex;
 use std::thread::JoinHandle;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, MonitorFromWindow,
+    GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
 };
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
@@ -26,31 +23,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CWPRETSTRUCT, CallNextHookEx, GWL_STYLE, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, HHOOK, IsIconic, IsZoomed, SIZE_MINIMIZED, SPI_GETWORKAREA,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowsHookExW, SystemParametersInfoW,
-    UnhookWindowsHookEx, WH_CALLWNDPROCRET, WINDOW_STYLE, WM_CLOSE, WM_SIZE, WS_CAPTION,
-    WS_THICKFRAME,
+    UnhookWindowsHookEx, WH_CALLWNDPROCRET, WM_CLOSE, WM_SIZE, WS_CAPTION, WS_THICKFRAME,
 };
 
-// =====================================================================
-// External entry points (C ABI).
-// =====================================================================
-
-unsafe extern "C" {
-    // jellyfin-desktop runtime hooks
-    fn jfn_shutdown_initiate();
-
-    // mpv handle + property/window helpers (src/mpv/jfn_mpv_api.h)
-    fn jfn_mpv_handle_get() -> *mut c_void;
-    fn jfn_mpv_get_property_int(name: *const std::ffi::c_char, out: *mut i64) -> i32;
-    fn jfn_mpv_set_fullscreen(v: bool);
-    fn jfn_mpv_toggle_fullscreen();
-    fn jfn_mpv_set_window_minimized(v: bool);
-    fn jfn_mpv_set_window_maximized(v: bool);
-
-    // playback state (src/playback/jfn_ingest.h)
-    fn jfn_playback_fullscreen() -> bool;
-    fn jfn_playback_display_scale() -> f64;
-
-}
+use jfn_mpv::api::{
+    jfn_mpv_get_property_int, jfn_mpv_set_fullscreen, jfn_mpv_set_window_maximized,
+    jfn_mpv_set_window_minimized, jfn_mpv_toggle_fullscreen,
+};
+use jfn_mpv::boot::jfn_mpv_handle_get;
+use jfn_playback::ingest_driver::{jfn_playback_display_scale, jfn_playback_fullscreen};
+use jfn_playback::shutdown::jfn_shutdown_initiate;
 
 // Input thread lives in `crate::input`.
 use crate::input::{
@@ -104,9 +86,8 @@ fn hwnd_from_raw(raw: usize) -> HWND {
 
 /// `jfn_win_get_hwnd` — returns mpv's HWND; nullptr before win_init or
 /// after cleanup.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_win_get_hwnd() -> *mut c_void {
-    STATE.lock().unwrap().mpv_hwnd_raw as *mut c_void
+pub fn jfn_win_get_hwnd() -> *mut c_void {
+    STATE.lock().mpv_hwnd_raw as *mut c_void
 }
 
 fn is_fullscreen_style(style: isize) -> bool {
@@ -118,15 +99,14 @@ fn is_fullscreen_style(style: isize) -> bool {
 // Scale + content-size lookups.
 // =====================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_get_scale() -> f32 {
-    let scale = unsafe { jfn_playback_display_scale() };
+pub fn win_get_scale() -> f32 {
+    let scale = jfn_playback_display_scale();
     if scale > 0.0 {
         let s = scale as f32;
-        STATE.lock().unwrap().cached_scale = s;
+        STATE.lock().cached_scale = s;
         return s;
     }
-    let cached = STATE.lock().unwrap().cached_scale;
+    let cached = STATE.lock().cached_scale;
     if cached > 0.0 {
         return cached;
     }
@@ -137,8 +117,7 @@ pub extern "C" fn win_get_scale() -> f32 {
 
 // Per-monitor DPI (GetDpiForMonitor) lives in Shcore.dll which isn't
 // currently linked; fall back to system DPI and ignore (x, y).
-#[unsafe(no_mangle)]
-pub extern "C" fn win_get_display_scale(_x: c_int, _y: c_int) -> f32 {
+pub fn win_get_display_scale(_x: c_int, _y: c_int) -> f32 {
     let dpi = unsafe { GetDpiForSystem() };
     if dpi > 0 { dpi as f32 / 96.0 } else { 1.0 }
 }
@@ -149,34 +128,32 @@ pub extern "C" fn win_get_display_scale(_x: c_int, _y: c_int) -> f32 {
 
 fn end_transition_if_settled(target_fullscreen: bool) {
     if crate::win_in_transition() {
-        let was_fs = STATE.lock().unwrap().was_fullscreen;
+        let was_fs = STATE.lock().was_fullscreen;
         if target_fullscreen == was_fs {
             crate::compositor::jfn_win_wndproc_end_transition_locked();
         }
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_set_fullscreen(fullscreen: bool) {
-    if unsafe { jfn_mpv_handle_get() }.is_null() {
+pub fn win_set_fullscreen(fullscreen: bool) {
+    if jfn_mpv_handle_get().is_null() {
         return;
     }
-    if unsafe { jfn_playback_fullscreen() } == fullscreen {
+    if jfn_playback_fullscreen() == fullscreen {
         end_transition_if_settled(fullscreen);
         return;
     }
 
-    let hwnd_raw = STATE.lock().unwrap().mpv_hwnd_raw;
+    let hwnd_raw = STATE.lock().mpv_hwnd_raw;
     let hwnd = hwnd_from_raw(hwnd_raw);
 
     if fullscreen {
-        STATE.lock().unwrap().restore_maximized_on_unfullscreen =
-            unsafe { IsZoomed(hwnd) }.as_bool();
+        STATE.lock().restore_maximized_on_unfullscreen = unsafe { IsZoomed(hwnd) }.as_bool();
     }
 
     let mut should_restore_maximized = false;
     if !fullscreen {
-        let mut st = STATE.lock().unwrap();
+        let mut st = STATE.lock();
         should_restore_maximized = st.restore_maximized_on_unfullscreen;
         st.restore_maximized_on_unfullscreen = false;
     }
@@ -187,34 +164,32 @@ pub extern "C" fn win_set_fullscreen(fullscreen: bool) {
     }
 
     if fullscreen {
-        unsafe { jfn_mpv_set_window_minimized(false) };
+        jfn_mpv_set_window_minimized(false);
     }
 
-    unsafe { jfn_mpv_set_fullscreen(fullscreen) };
+    jfn_mpv_set_fullscreen(fullscreen);
 
     if !fullscreen && should_restore_maximized {
-        unsafe { jfn_mpv_set_window_maximized(true) };
+        jfn_mpv_set_window_maximized(true);
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_toggle_fullscreen() {
-    if unsafe { jfn_mpv_handle_get() }.is_null() {
+pub fn win_toggle_fullscreen() {
+    if jfn_mpv_handle_get().is_null() {
         return;
     }
-    let target_fullscreen = !unsafe { jfn_playback_fullscreen() };
+    let target_fullscreen = !jfn_playback_fullscreen();
 
-    let hwnd_raw = STATE.lock().unwrap().mpv_hwnd_raw;
+    let hwnd_raw = STATE.lock().mpv_hwnd_raw;
     let hwnd = hwnd_from_raw(hwnd_raw);
 
     if target_fullscreen {
-        STATE.lock().unwrap().restore_maximized_on_unfullscreen =
-            unsafe { IsZoomed(hwnd) }.as_bool();
+        STATE.lock().restore_maximized_on_unfullscreen = unsafe { IsZoomed(hwnd) }.as_bool();
     }
 
     let mut should_restore_maximized = false;
     if !target_fullscreen {
-        let mut st = STATE.lock().unwrap();
+        let mut st = STATE.lock();
         should_restore_maximized = st.restore_maximized_on_unfullscreen;
         st.restore_maximized_on_unfullscreen = false;
     }
@@ -225,13 +200,13 @@ pub extern "C" fn win_toggle_fullscreen() {
     }
 
     if target_fullscreen {
-        unsafe { jfn_mpv_set_window_minimized(false) };
+        jfn_mpv_set_window_minimized(false);
     }
 
-    unsafe { jfn_mpv_toggle_fullscreen() };
+    jfn_mpv_toggle_fullscreen();
 
     if !target_fullscreen && should_restore_maximized {
-        unsafe { jfn_mpv_set_window_maximized(true) };
+        jfn_mpv_set_window_maximized(true);
     }
 }
 
@@ -239,19 +214,15 @@ pub extern "C" fn win_toggle_fullscreen() {
 // WndProc hook.
 // =====================================================================
 
-unsafe extern "system" fn mpv_wndproc_hook(
-    n_code: c_int,
-    wp: WPARAM,
-    lp: LPARAM,
-) -> LRESULT {
+unsafe extern "system" fn mpv_wndproc_hook(n_code: c_int, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if n_code >= 0 {
         let msg = unsafe { &*(lp.0 as *const CWPRETSTRUCT) };
-        let target_hwnd_raw = STATE.lock().unwrap().mpv_hwnd_raw;
+        let target_hwnd_raw = STATE.lock().mpv_hwnd_raw;
         if (msg.hwnd.0 as usize) == target_hwnd_raw {
             if msg.message == WM_SIZE {
                 if msg.wParam.0 == SIZE_MINIMIZED as usize {
-                    STATE.lock().unwrap().was_minimized = true;
-                    let hook_raw = STATE.lock().unwrap().wndproc_hook_raw;
+                    STATE.lock().was_minimized = true;
+                    let hook_raw = STATE.lock().wndproc_hook_raw;
                     let hook = HHOOK(hook_raw as *mut c_void);
                     return unsafe { CallNextHookEx(Some(hook), n_code, wp, lp) };
                 }
@@ -260,68 +231,75 @@ unsafe extern "system" fn mpv_wndproc_hook(
                 let pw = (lparam & 0xFFFF) as c_int;
                 let ph = ((lparam >> 16) & 0xFFFF) as c_int;
                 if pw > 0 && ph > 0 {
-                    unsafe { jfn_input_windows_resize_to_parent(pw, ph) };
+                    jfn_input_windows_resize_to_parent(pw, ph);
 
-                    let cached = STATE.lock().unwrap().cached_scale;
+                    let cached = STATE.lock().cached_scale;
                     let scale = if cached > 0.0 { cached } else { 1.0 };
                     let lw = (pw as f32 / scale) as c_int;
                     let lh = (ph as f32 / scale) as c_int;
 
-                    let style = unsafe {
-                        GetWindowLongPtrW(hwnd_from_raw(target_hwnd_raw), GWL_STYLE)
-                    };
+                    let style =
+                        unsafe { GetWindowLongPtrW(hwnd_from_raw(target_hwnd_raw), GWL_STYLE) };
                     let fs = is_fullscreen_style(style);
 
-                    let recovering_from_minimize = STATE.lock().unwrap().was_minimized;
+                    // Fullscreen-style edge, computed before mutating stored
+                    // state so we can both decide whether to *begin* a
+                    // transition and tell the compositor when to *end* one.
+                    let was_fs = STATE.lock().was_fullscreen;
+                    let fs_changed = fs != was_fs;
+                    let recovering_from_minimize = STATE.lock().was_minimized;
+
                     if recovering_from_minimize {
-                        {
-                            let mut st = STATE.lock().unwrap();
-                            st.was_minimized = false;
-                            st.was_fullscreen = fs;
-                        }
-                        if crate::win_in_transition() {
-                            crate::compositor::jfn_win_wndproc_end_transition_locked();
-                        }
-                    } else {
-                        let was_fs = STATE.lock().unwrap().was_fullscreen;
-                        if fs != was_fs {
-                            if !crate::win_in_transition() {
-                                crate::compositor::jfn_win_wndproc_begin_transition_locked();
-                            } else {
-                                crate::compositor::jfn_win_wndproc_end_transition_locked();
-                            }
-                            STATE.lock().unwrap().was_fullscreen = fs;
-                        } else if crate::win_in_transition() {
-                            crate::compositor::jfn_win_wndproc_end_transition_locked();
+                        let mut st = STATE.lock();
+                        st.was_minimized = false;
+                        st.was_fullscreen = fs;
+                    } else if fs_changed {
+                        STATE.lock().was_fullscreen = fs;
+                        // A fullscreen change we didn't drive through the
+                        // toggle helpers (e.g. an mpv-initiated one) needs a
+                        // transition begun here so the stale-size OSD is
+                        // detached until the window settles. Helper-initiated
+                        // changes already began one; never start a second.
+                        // Starting a second is what previously left
+                        // G_TRANSITIONING stuck across multiple WM_SIZE events
+                        // and blanked the OSD on exit from fullscreen.
+                        if !crate::win_in_transition() {
+                            crate::compositor::jfn_win_wndproc_begin_transition_locked();
                         }
                     }
-                    crate::compositor::jfn_win_update_surface_size(lw, lh, pw, ph);
+
+                    // End any in-progress transition once the window has
+                    // actually reached its new physical size (handled inside
+                    // the compositor, where the size captured at begin lives).
+                    // The force-end flag covers a settled fullscreen edge whose
+                    // physical size happens to be unchanged.
+                    crate::compositor::jfn_win_update_surface_size(
+                        lw,
+                        lh,
+                        pw,
+                        ph,
+                        fs_changed || recovering_from_minimize,
+                    );
                 }
             } else if msg.message == WM_CLOSE {
-                unsafe { jfn_shutdown_initiate() };
+                jfn_shutdown_initiate();
             }
         }
     }
-    let hook_raw = STATE.lock().unwrap().wndproc_hook_raw;
+    let hook_raw = STATE.lock().wndproc_hook_raw;
     let hook = HHOOK(hook_raw as *mut c_void);
     unsafe { CallNextHookEx(Some(hook), n_code, wp, lp) }
 }
-
-// Silence "WINDOW_STYLE never used directly" — referenced via constants.
-#[allow(dead_code)]
-const _USED: WINDOW_STYLE = WS_CAPTION;
 
 // =====================================================================
 // Platform vtable entry points.
 // =====================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_early_init() {
+pub fn win_early_init() {
     // Nothing needed on Windows before mpv starts.
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_init(_mpv: *mut c_void) -> bool {
+pub fn win_init(_mpv: *mut c_void) -> bool {
     let mut wid: i64 = 0;
     let name = c"window-id";
     let rc = unsafe { jfn_mpv_get_property_int(name.as_ptr(), &mut wid) };
@@ -330,7 +308,7 @@ pub extern "C" fn win_init(_mpv: *mut c_void) -> bool {
         return false;
     }
     let hwnd_raw = wid as usize;
-    STATE.lock().unwrap().mpv_hwnd_raw = hwnd_raw;
+    STATE.lock().mpv_hwnd_raw = hwnd_raw;
 
     // Seed cached_scale.
     win_get_scale();
@@ -354,16 +332,14 @@ pub extern "C" fn win_init(_mpv: *mut c_void) -> bool {
     // doesn't start a spurious transition if already fullscreen.
     {
         let style = unsafe { GetWindowLongPtrW(hwnd_from_raw(hwnd_raw), GWL_STYLE) };
-        STATE.lock().unwrap().was_fullscreen = is_fullscreen_style(style);
+        STATE.lock().was_fullscreen = is_fullscreen_style(style);
     }
 
-    let mpv_tid =
-        unsafe { GetWindowThreadProcessId(hwnd_from_raw(hwnd_raw), None) };
-    let hook = unsafe {
-        SetWindowsHookExW(WH_CALLWNDPROCRET, Some(mpv_wndproc_hook), None, mpv_tid)
-    };
+    let mpv_tid = unsafe { GetWindowThreadProcessId(hwnd_from_raw(hwnd_raw), None) };
+    let hook =
+        unsafe { SetWindowsHookExW(WH_CALLWNDPROCRET, Some(mpv_wndproc_hook), None, mpv_tid) };
     match hook {
-        Ok(h) => STATE.lock().unwrap().wndproc_hook_raw = h.0 as usize,
+        Ok(h) => STATE.lock().wndproc_hook_raw = h.0 as usize,
         Err(e) => {
             tracing::error!("SetWindowsHookExW(WH_CALLWNDPROCRET) failed: {e:?}");
             return false;
@@ -372,33 +348,32 @@ pub extern "C" fn win_init(_mpv: *mut c_void) -> bool {
 
     let mpv_hwnd_for_thread = hwnd_raw;
     let join = std::thread::spawn(move || {
-        unsafe { jfn_input_windows_run_input_thread(mpv_hwnd_for_thread as *mut c_void) };
+        jfn_input_windows_run_input_thread(mpv_hwnd_for_thread as *mut c_void);
     });
-    STATE.lock().unwrap().input_thread = Some(join);
+    STATE.lock().input_thread = Some(join);
 
     tracing::info!("Windows DirectComposition compositor initialized");
     true
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn win_cleanup() {
-    unsafe { jfn_input_windows_stop_input_thread() };
-    let join = STATE.lock().unwrap().input_thread.take();
+pub fn win_cleanup() {
+    jfn_input_windows_stop_input_thread();
+    let join = STATE.lock().input_thread.take();
     if let Some(j) = join {
         let _ = j.join();
     }
-    let hook_raw = STATE.lock().unwrap().wndproc_hook_raw;
+    let hook_raw = STATE.lock().wndproc_hook_raw;
     if hook_raw != 0 {
         let hook = HHOOK(hook_raw as *mut c_void);
         unsafe {
             let _ = UnhookWindowsHookEx(hook);
         }
-        STATE.lock().unwrap().wndproc_hook_raw = 0;
+        STATE.lock().wndproc_hook_raw = 0;
     }
 
     crate::compositor::jfn_win_cleanup_compositor();
 
-    STATE.lock().unwrap().mpv_hwnd_raw = 0;
+    STATE.lock().mpv_hwnd_raw = 0;
 }
 
 // =====================================================================
@@ -409,9 +384,8 @@ pub extern "C" fn win_cleanup() {
 /// taskbar), in physical pixels. Matches mpv's `--geometry +X+Y`
 /// coordinate system on Windows (`vo_calc_window_geometry` uses the
 /// working area).
-#[unsafe(no_mangle)]
-pub extern "C" fn win_query_window_position(x: *mut c_int, y: *mut c_int) -> bool {
-    let hwnd_raw = STATE.lock().unwrap().mpv_hwnd_raw;
+pub fn win_query_window_position(x: &mut c_int, y: &mut c_int) -> bool {
+    let hwnd_raw = STATE.lock().mpv_hwnd_raw;
     if hwnd_raw == 0 {
         return false;
     }
@@ -428,23 +402,15 @@ pub extern "C" fn win_query_window_position(x: *mut c_int, y: *mut c_int) -> boo
     if !unsafe { GetMonitorInfoW(mon, &mut mi) }.as_bool() {
         return false;
     }
-    unsafe {
-        *x = wr.left - mi.rcWork.left;
-        *y = wr.top - mi.rcWork.top;
-    }
+    *x = wr.left - mi.rcWork.left;
+    *y = wr.top - mi.rcWork.top;
     true
 }
 
 /// Resolve saved geometry against the primary monitor's working area so the
 /// window never opens larger than the screen or off-screen, and center any
 /// unset axis.
-#[unsafe(no_mangle)]
-pub extern "C" fn win_clamp_window_geometry(
-    w: *mut c_int,
-    h: *mut c_int,
-    x: *mut c_int,
-    y: *mut c_int,
-) {
+pub fn win_clamp_window_geometry(w: &mut c_int, h: &mut c_int, x: &mut c_int, y: &mut c_int) {
     let mut work = RECT::default();
     let ok = unsafe {
         SystemParametersInfoW(
@@ -459,14 +425,28 @@ pub extern "C" fn win_clamp_window_geometry(
     }
     let vw = work.right - work.left;
     let vh = work.bottom - work.top;
-    unsafe {
-        if *w > vw { *w = vw; }
-        if *h > vh { *h = vh; }
-        if *x < 0 { *x = (vw - *w) / 2; }
-        if *y < 0 { *y = (vh - *h) / 2; }
-        if *x + *w > vw { *x = vw - *w; }
-        if *y + *h > vh { *y = vh - *h; }
-        if *x < 0 { *x = 0; }
-        if *y < 0 { *y = 0; }
+    if *w > vw {
+        *w = vw;
+    }
+    if *h > vh {
+        *h = vh;
+    }
+    if *x < 0 {
+        *x = (vw - *w) / 2;
+    }
+    if *y < 0 {
+        *y = (vh - *h) / 2;
+    }
+    if *x + *w > vw {
+        *x = vw - *w;
+    }
+    if *y + *h > vh {
+        *y = vh - *h;
+    }
+    if *x < 0 {
+        *x = 0;
+    }
+    if *y < 0 {
+        *y = 0;
     }
 }

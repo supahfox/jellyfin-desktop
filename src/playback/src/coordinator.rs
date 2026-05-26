@@ -3,19 +3,20 @@
 //! them in batches, runs transitions, publishes the canonical snapshot,
 //! and hands events to registered sinks via the FFI vtable.
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::wake_event::WakeEvent;
 
-use crate::ffi::{ActionSinkEntry, EventSinkEntry};
+use crate::ffi::{ActionSink, EventSink};
 use crate::state_machine::PlaybackStateMachine;
 use crate::types::*;
 
 #[derive(Debug)]
-pub(crate) enum Input {
+pub enum Input {
     FileLoaded,
     LoadStarting(String),
     PauseChanged(bool),
@@ -52,25 +53,26 @@ pub(crate) enum Input {
     Seeked(i64),
 }
 
-/// Rust-side sink closure types. Run inline on the coordinator worker
-/// thread immediately after the FFI sinks. Must not block.
-pub(crate) type BuiltinEventSink = Box<dyn Fn(&PlaybackEvent) + Send + Sync>;
-pub(crate) type BuiltinActionSink = Box<dyn Fn(&PlaybackAction) + Send + Sync>;
-
 struct Shared {
     queue: Mutex<VecDeque<Input>>,
     wake: WakeEvent,
     running: AtomicBool,
     snapshot: Mutex<PlaybackSnapshot>,
-    event_sinks: Mutex<Vec<EventSinkEntry>>,
-    action_sinks: Mutex<Vec<ActionSinkEntry>>,
-    builtin_event_sinks: Mutex<Vec<BuiltinEventSink>>,
-    builtin_action_sinks: Mutex<Vec<BuiltinActionSink>>,
+    event_sinks: Mutex<Vec<EventSink>>,
+    action_sinks: Mutex<Vec<ActionSink>>,
+    builtin_event_sinks: Mutex<Vec<EventSink>>,
+    builtin_action_sinks: Mutex<Vec<ActionSink>>,
 }
 
 pub struct PlaybackCoordinator {
     shared: Arc<Shared>,
     join: Option<JoinHandle<()>>,
+}
+
+impl Default for PlaybackCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PlaybackCoordinator {
@@ -108,32 +110,32 @@ impl PlaybackCoordinator {
         }
     }
 
-    pub(crate) fn enqueue(&self, in_: Input) {
+    pub fn enqueue(&self, in_: Input) {
         {
-            let mut q = self.shared.queue.lock().unwrap();
+            let mut q = self.shared.queue.lock();
             q.push_back(in_);
         }
         self.shared.wake.signal();
     }
 
     pub fn snapshot(&self) -> PlaybackSnapshot {
-        self.shared.snapshot.lock().unwrap().clone()
+        self.shared.snapshot.lock().clone()
     }
 
-    pub(crate) fn add_event_sink(&self, sink: EventSinkEntry) {
-        self.shared.event_sinks.lock().unwrap().push(sink);
+    pub fn add_event_sink(&self, sink: EventSink) {
+        self.shared.event_sinks.lock().push(sink);
     }
 
-    pub(crate) fn add_action_sink(&self, sink: ActionSinkEntry) {
-        self.shared.action_sinks.lock().unwrap().push(sink);
+    pub fn add_action_sink(&self, sink: ActionSink) {
+        self.shared.action_sinks.lock().push(sink);
     }
 
-    pub fn add_builtin_event_sink(&self, sink: BuiltinEventSink) {
-        self.shared.builtin_event_sinks.lock().unwrap().push(sink);
+    pub fn add_builtin_event_sink(&self, sink: EventSink) {
+        self.shared.builtin_event_sinks.lock().push(sink);
     }
 
-    pub fn add_builtin_action_sink(&self, sink: BuiltinActionSink) {
-        self.shared.builtin_action_sinks.lock().unwrap().push(sink);
+    pub fn add_builtin_action_sink(&self, sink: ActionSink) {
+        self.shared.builtin_action_sinks.lock().push(sink);
     }
 }
 
@@ -147,7 +149,7 @@ fn worker(shared: Arc<Shared>) {
     let mut sm = PlaybackStateMachine::new();
     while shared.running.load(Ordering::Relaxed) {
         let work: VecDeque<Input> = {
-            let mut q = shared.queue.lock().unwrap();
+            let mut q = shared.queue.lock();
             std::mem::take(&mut *q)
         };
 
@@ -169,31 +171,31 @@ fn worker(shared: Arc<Shared>) {
             e.snapshot = snap.clone();
         }
         {
-            let mut s = shared.snapshot.lock().unwrap();
+            let mut s = shared.snapshot.lock();
             *s = snap;
         }
 
-        // Sinks: dispatched in registration order. Each sink's try_post
-        // must not block; the sink owns its own queue + consumer thread.
-        let event_sinks = shared.event_sinks.lock().unwrap();
+        // Sinks: dispatched in registration order. Each closure must
+        // not block; sinks own their own queue + consumer thread.
+        let event_sinks = shared.event_sinks.lock();
         for sink in event_sinks.iter() {
             for e in &events {
-                sink.dispatch(e);
+                sink(e);
             }
         }
-        let action_sinks = shared.action_sinks.lock().unwrap();
+        let action_sinks = shared.action_sinks.lock();
         for sink in action_sinks.iter() {
             for a in &actions {
-                sink.dispatch(a);
+                sink(a);
             }
         }
-        let builtin_event_sinks = shared.builtin_event_sinks.lock().unwrap();
+        let builtin_event_sinks = shared.builtin_event_sinks.lock();
         for sink in builtin_event_sinks.iter() {
             for e in &events {
                 sink(e);
             }
         }
-        let builtin_action_sinks = shared.builtin_action_sinks.lock().unwrap();
+        let builtin_action_sinks = shared.builtin_action_sinks.lock();
         for sink in builtin_action_sinks.iter() {
             for a in &actions {
                 sink(a);
@@ -227,7 +229,10 @@ fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEven
         Input::FileLoaded => sm.on_file_loaded(),
         Input::LoadStarting(id) => sm.on_load_starting(id),
         Input::PauseChanged(paused) => sm.on_pause_changed(paused),
-        Input::EndFile { reason, error_message } => sm.on_end_file(reason, error_message),
+        Input::EndFile {
+            reason,
+            error_message,
+        } => sm.on_end_file(reason, error_message),
         Input::SeekingChanged(seeking) => sm.on_seeking_changed(seeking),
         Input::PausedForCache(pfc) => sm.on_paused_for_cache(pfc),
         Input::CoreIdle(ci) => sm.on_core_idle(ci),
@@ -236,9 +241,10 @@ fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEven
         Input::VideoFrameAvailable(a) => sm.on_video_frame_available(a),
         Input::Speed(r) => sm.on_speed(r),
         Input::Duration(d) => sm.on_duration(d),
-        Input::Fullscreen { fullscreen, was_maximized } => {
-            sm.on_fullscreen(fullscreen, was_maximized)
-        }
+        Input::Fullscreen {
+            fullscreen,
+            was_maximized,
+        } => sm.on_fullscreen(fullscreen, was_maximized),
         Input::OsdDims { lw, lh, pw, ph } => sm.on_osd_dims(lw, lh, pw, ph),
         Input::BufferedRanges(r) => sm.on_buffered_ranges(r),
         Input::DisplayHz(h) => sm.on_display_hz(h),
@@ -256,7 +262,10 @@ fn apply(sm: &mut PlaybackStateMachine, input: Input, out: &mut Vec<PlaybackEven
             ev.artwork_uri = uri;
             vec![ev]
         }
-        Input::QueueCaps { can_go_next, can_go_prev } => {
+        Input::QueueCaps {
+            can_go_next,
+            can_go_prev,
+        } => {
             let mut ev = PlaybackEvent::new(PlaybackEventKind::QueueCapsChanged);
             ev.can_go_next = can_go_next;
             ev.can_go_prev = can_go_prev;

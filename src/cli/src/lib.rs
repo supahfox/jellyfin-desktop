@@ -1,7 +1,7 @@
-//! Argv parser for jellyfin-desktop. Replaces the hand-rolled C++ parser in
-//! `src/cli.cpp` with clap. Help/version short-circuits return distinct kinds
-//! so the C++ side can run its own printers (which need `mpv_handle` and
-//! version macros not available here).
+//! Argv parser for jellyfin-desktop, built on clap. Help/version
+//! short-circuits return distinct kinds so the caller can run its own
+//! printers (which need a live `mpv_handle` and version macros not
+//! available here).
 
 use clap::error::ContextKind;
 use clap::{ArgAction, Parser};
@@ -154,8 +154,7 @@ fn parse_inner(args: Vec<String>, have_x11: bool) -> JfnCliResult {
 /// `argv` must point to `argc` valid NUL-terminated C strings (or null
 /// entries, which are treated as empty). The returned pointer is heap-owned
 /// by Rust; free with [`jfn_cli_result_free`].
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_cli_parse(
+pub unsafe fn jfn_cli_parse(
     argc: c_int,
     argv: *const *const c_char,
     have_x11: bool,
@@ -178,8 +177,7 @@ pub unsafe extern "C" fn jfn_cli_parse(
 /// # Safety
 /// `r` must either be null or a pointer returned by [`jfn_cli_parse`]. Each
 /// pointer may only be freed once.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_cli_result_free(r: *mut JfnCliResult) {
+pub unsafe fn jfn_cli_result_free(r: *mut JfnCliResult) {
     if r.is_null() {
         return;
     }
@@ -314,14 +312,22 @@ mod tests {
     fn space_form_all_flags() {
         let r = parse(&[
             "app",
-            "--hwdec", "vaapi",
-            "--log-level", "debug",
-            "--log-file", "/tmp/x.log",
-            "--audio-passthrough", "ac3,dts-hd",
-            "--audio-channels", "5.1",
-            "--remote-debug-port", "9222",
-            "--ozone-platform", "wayland",
-            "--platform", "x11",
+            "--hwdec",
+            "vaapi",
+            "--log-level",
+            "debug",
+            "--log-file",
+            "/tmp/x.log",
+            "--audio-passthrough",
+            "ac3,dts-hd",
+            "--audio-channels",
+            "5.1",
+            "--remote-debug-port",
+            "9222",
+            "--ozone-platform",
+            "wayland",
+            "--platform",
+            "x11",
         ]);
         assert!(matches!(r.kind, JfnCliResultKind::Continue));
         let cs = |p| unsafe { CStr::from_ptr(p) }.to_str().unwrap();
@@ -370,7 +376,14 @@ mod tests {
 
     #[test]
     fn error_leaves_value_fields_null() {
-        let r = parse(&["app", "--hwdec", "vaapi", "--garbage", "--log-level", "debug"]);
+        let r = parse(&[
+            "app",
+            "--hwdec",
+            "vaapi",
+            "--garbage",
+            "--log-level",
+            "debug",
+        ]);
         assert!(matches!(r.kind, JfnCliResultKind::Error));
         assert!(r.hwdec.is_null());
         assert!(r.log_level.is_null());

@@ -1,47 +1,40 @@
 //! macOS NSApplication lifecycle + window/display-link/menu init.
 //!
-//! Ports the remaining bodies of `src/platform/macos.mm` (`macos_early_init`,
-//! `macos_init`, `macos_cleanup`) plus their helpers — JellyfinApplication
-//! NSApplication subclass conforming to CefAppProtocol, the application
-//! menu bar (App + Edit), the CADisplayLink target that drives external
-//! BeginFrame per browser, and the NSWindow.windowShouldClose: swizzle
-//! that routes the WM close button into `jfn_shutdown_initiate`.
+//! JellyfinApplication NSApplication subclass conforming to CefAppProtocol,
+//! the application menu bar (App + Edit), the CADisplayLink target that
+//! drives external BeginFrame per browser, and the NSWindow.windowShouldClose:
+//! swizzle that routes the WM close button into `jfn_shutdown_initiate`.
 
+// Platform entry points take raw pointers from the C/Obj-C boundary; the
+// safety contract is the boundary's, matching the wayland/x11 backends.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
+use parking_lot::Mutex;
 use std::cell::Cell;
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr;
-use std::sync::Mutex;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
-use objc2::{class, define_class, extern_class, msg_send, sel, AnyThread, ClassType, DefinedClass};
+use objc2::{ClassType, DefinedClass, class, define_class, extern_class, msg_send, sel};
 use objc2_foundation::{NSObject, NSObjectProtocol, NSRect};
 
-// Reach the input view created by the Rust input crate. We adopt the
+// The input NSView is created by the input module; we adopt the
 // +1-retained NSView returned here; ownership moves into INPUT_VIEW.
-unsafe extern "C" {
-    fn jfn_input_macos_create_view() -> *mut AnyObject;
-}
+use crate::input::jfn_input_macos_create_view;
 
-// jfn-cef Rust APIs we need.
-unsafe extern "C" {
-    fn jfn_browsers_send_external_begin_frame_all();
-    fn jfn_about_open();
-    fn jfn_shutdown_initiate();
-    fn jfn_shutting_down() -> bool;
-    fn jfn_mpv_set_force_window_position(v: bool);
-}
+use jfn_playback::shutdown::{jfn_shutdown_initiate, jfn_shutting_down};
+
+use jfn_cef::browsers::jfn_browsers_send_external_begin_frame_all;
+use jfn_cef::business_about::jfn_about_open;
+use jfn_mpv::api::jfn_mpv_set_force_window_position;
 
 // libdispatch / NSAutoreleasePool primitives — shared with the rest of the
 // crate but re-declared here to keep this file self-contained.
 unsafe extern "C" {
     fn objc_getProtocol(name: *const c_char) -> *mut AnyObject;
-    fn protocol_getName(p: *mut AnyObject) -> *const c_char;
     fn class_addProtocol(cls: *const AnyClass, p: *mut AnyObject) -> Bool;
-    fn class_getInstanceMethod(
-        cls: *const AnyClass,
-        sel: Sel,
-    ) -> *mut c_void;
+    fn class_getInstanceMethod(cls: *const AnyClass, sel: Sel) -> *mut c_void;
     fn method_setImplementation(method: *mut c_void, imp: *const c_void) -> *const c_void;
     fn imp_implementationWithBlock(block: *const c_void) -> *const c_void;
 }
@@ -82,24 +75,21 @@ static INIT_STATE: Mutex<InitState> = Mutex::new(InitState {
 
 /// Returns the `NSWindow*` (non-retaining) for use by other modules.
 /// Null before macos_init or after macos_cleanup.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_macos_get_window() -> *mut AnyObject {
-    INIT_STATE.lock().unwrap().window
+pub fn jfn_macos_get_window() -> *mut AnyObject {
+    INIT_STATE.lock().window
 }
 
 /// Returns the `JellyfinInputView*` (non-retaining) so `macos_restack`
 /// can re-anchor it on top of the CefLayer subviews after a reorder.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_macos_get_input_view() -> *mut AnyObject {
-    INIT_STATE.lock().unwrap().input_view
+pub fn jfn_macos_get_input_view() -> *mut AnyObject {
+    INIT_STATE.lock().input_view
 }
 
 /// Logical content view size in points. Backs `JfnIngest`'s macOS-only
 /// "use the OS's logical size, not osd-dimensions" branch.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_macos_query_logical_content_size(w: *mut c_int, h: *mut c_int) -> bool {
+pub fn jfn_macos_query_logical_content_size(w: *mut c_int, h: *mut c_int) -> bool {
     unsafe {
-        let win = INIT_STATE.lock().unwrap().window;
+        let win = INIT_STATE.lock().window;
         if win.is_null() {
             return false;
         }
@@ -119,9 +109,8 @@ pub extern "C" fn jfn_macos_query_logical_content_size(w: *mut c_int, h: *mut c_
 // (lib.rs) either inline (already on main) or via dispatch_async_f.
 // =====================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_macos_apply_theme_color_on_main(rgb: u32) {
-    let win = INIT_STATE.lock().unwrap().window;
+pub fn jfn_macos_apply_theme_color_on_main(rgb: u32) {
+    let win = INIT_STATE.lock().window;
     unsafe { apply_theme_color_to_window(win, rgb) };
 }
 
@@ -204,7 +193,7 @@ define_class!(
 
         #[unsafe(method(terminate:))]
         unsafe fn terminate(&self, _sender: *mut AnyObject) {
-            unsafe { jfn_shutdown_initiate() };
+            jfn_shutdown_initiate();
         }
 
         #[unsafe(method(handleReopenEvent:withReplyEvent:))]
@@ -259,7 +248,7 @@ define_class!(
     impl JellyfinAppMenuTarget {
         #[unsafe(method(showAbout:))]
         unsafe fn show_about(&self, _sender: *mut AnyObject) {
-            unsafe { jfn_about_open() };
+            jfn_about_open();
         }
     }
 
@@ -280,10 +269,10 @@ define_class!(
     impl JellyfinDisplayLinkTarget {
         #[unsafe(method(tick:))]
         unsafe fn tick(&self, _link: *mut AnyObject) {
-            if unsafe { jfn_shutting_down() } {
+            if jfn_shutting_down() {
                 return;
             }
-            unsafe { jfn_browsers_send_external_begin_frame_all() };
+            jfn_browsers_send_external_begin_frame_all();
         }
     }
 
@@ -371,8 +360,9 @@ unsafe fn stop_display_link(state: &mut InitState) {
 // wait-for-window loop in macos_init).
 // =====================================================================
 
+use crate::macos_pump;
+
 unsafe extern "C" {
-    fn macos_pump();
     fn usleep(usec: u32) -> i32;
 }
 
@@ -382,11 +372,10 @@ unsafe extern "C" {
 // link.
 // =====================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_init(_mpv: *mut c_void) -> bool {
+pub fn macos_init(_mpv: *mut c_void) -> bool {
     tracing::info!(target: LOG_TARGET, "[INIT] macos_init: waiting for mpv window");
 
-    let mut state = INIT_STATE.lock().unwrap();
+    let mut state = INIT_STATE.lock();
     unsafe {
         // Spin until mpv creates its NSWindow.
         for _ in 0..500 {
@@ -441,7 +430,7 @@ pub extern "C" fn macos_init(_mpv: *mut c_void) -> bool {
                 _self_: *mut AnyObject,
                 _win: *mut AnyObject,
             ) -> Bool {
-                unsafe { jfn_shutdown_initiate() };
+                jfn_shutdown_initiate();
                 Bool::NO
             }
             // Hand-rolled "global" block — flags = BLOCK_IS_GLOBAL (1<<28),
@@ -452,11 +441,7 @@ pub extern "C" fn macos_init(_mpv: *mut c_void) -> bool {
                 isa: *const c_void,
                 flags: i32,
                 reserved: i32,
-                invoke: unsafe extern "C" fn(
-                    *mut c_void,
-                    *mut AnyObject,
-                    *mut AnyObject,
-                ) -> Bool,
+                invoke: unsafe extern "C" fn(*mut c_void, *mut AnyObject, *mut AnyObject) -> Bool,
                 descriptor: *const BlockDescriptor,
             }
             #[repr(C)]
@@ -473,7 +458,7 @@ pub extern "C" fn macos_init(_mpv: *mut c_void) -> bool {
                 size: std::mem::size_of::<GlobalBlock>(),
             };
             static BLOCK: GlobalBlock = GlobalBlock {
-                isa: unsafe { &_NSConcreteGlobalBlock as *const _ as *const c_void },
+                isa: unsafe { &_NSConcreteGlobalBlock as *const c_void },
                 flags: 1 << 28, // BLOCK_IS_GLOBAL
                 reserved: 0,
                 invoke: close_block_invoke,
@@ -502,10 +487,7 @@ pub extern "C" fn macos_init(_mpv: *mut c_void) -> bool {
                     stringByAppendingPathComponent: icon_ns
                 ];
                 if !icon_path.is_null() {
-                    let icon: *mut AnyObject = msg_send![
-                        class!(NSImage),
-                        alloc
-                    ];
+                    let icon: *mut AnyObject = msg_send![class!(NSImage), alloc];
                     let icon: *mut AnyObject = msg_send![
                         icon,
                         initWithContentsOfFile: icon_path
@@ -543,8 +525,8 @@ pub extern "C" fn macos_init(_mpv: *mut c_void) -> bool {
         // helper since we already hold INIT_STATE.
         apply_theme_color_to_window(state.window, K_BG_COLOR);
 
-        // Adopt the +1-retained NSView returned by the Rust input crate.
-        state.input_view = jfn_input_macos_create_view();
+        // Adopt the +1-retained NSView returned by the input module.
+        state.input_view = jfn_input_macos_create_view() as *mut AnyObject;
         if !state.input_view.is_null() && !content_view.is_null() {
             let bounds: NSRect = msg_send![content_view, bounds];
             let _: () = msg_send![state.input_view, setFrame: bounds];
@@ -576,13 +558,10 @@ pub extern "C" fn macos_init(_mpv: *mut c_void) -> bool {
 // retained AppKit handles, tear down the Rust-side compositor.
 // =====================================================================
 
-unsafe extern "C" {
-    fn jfn_macos_compositor_cleanup();
-}
+use crate::compositor::jfn_macos_compositor_cleanup;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_cleanup() {
-    let mut state = INIT_STATE.lock().unwrap();
+pub fn macos_cleanup() {
+    let mut state = INIT_STATE.lock();
     unsafe {
         stop_display_link(&mut state);
 
@@ -606,15 +585,13 @@ pub extern "C" fn macos_cleanup() {
 // set the activation policy, build the App + Edit menu bar.
 // =====================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_early_init() {
+pub fn macos_early_init() {
     unsafe {
         // Attach CefAppProtocol to our subclass before -sharedApplication
         // is called so CEF's runtime conforms-to check passes.
         attach_cef_app_protocol(JellyfinApplication::class());
 
-        let app_obj: *mut AnyObject =
-            msg_send![JellyfinApplication::class(), sharedApplication];
+        let app_obj: *mut AnyObject = msg_send![JellyfinApplication::class(), sharedApplication];
 
         // Install Apple-event reopen handler (Dock click etc.).
         let ae_mgr: *mut AnyObject =
@@ -644,23 +621,20 @@ pub extern "C" fn macos_early_init() {
 
         // Disable AppKit's automatic Edit-menu inserts (Dictation,
         // Character Palette) so a plain "e" can't trigger them.
-        let defaults: *mut AnyObject =
-            msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let defaults: *mut AnyObject = msg_send![class!(NSUserDefaults), standardUserDefaults];
         for k in [
             c"NSDisabledDictationMenuItem",
             c"NSDisabledCharacterPaletteMenuItem",
         ] {
-            let ns: *mut AnyObject =
-                msg_send![class!(NSString), stringWithUTF8String: k.as_ptr()];
+            let ns: *mut AnyObject = msg_send![class!(NSString), stringWithUTF8String: k.as_ptr()];
             let _: () = msg_send![defaults, setBool: true, forKey: ns];
         }
 
         // Allocate the App menu target (kept alive for process lifetime
         // via INIT_STATE).
-        let mt: Retained<JellyfinAppMenuTarget> =
-            msg_send![JellyfinAppMenuTarget::class(), new];
+        let mt: Retained<JellyfinAppMenuTarget> = msg_send![JellyfinAppMenuTarget::class(), new];
         let mt_obj: *mut AnyObject = Retained::into_raw(mt) as *mut AnyObject;
-        INIT_STATE.lock().unwrap().app_menu_target = mt_obj;
+        INIT_STATE.lock().app_menu_target = mt_obj;
 
         // Build the menu bar.
         let menubar: *mut AnyObject = msg_send![class!(NSMenu), alloc];

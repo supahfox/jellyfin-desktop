@@ -1,15 +1,15 @@
 //! macOS input — NSEvent translation + JellyfinInputView NSView subclass.
 //!
-//! Ported from `src/input/input_macos.mm`. The NSView is created by C++
-//! `macos_init` via the `jfn_input_macos_create_view` extern "C" thunk;
+//! The NSView is created by `macos_init` via the
+//! `jfn_input_macos_create_view` extern "C" thunk;
 //! `jfn_input_macos_set_cursor` is wired into the Platform vtable.
 //!
 //! Event dispatch goes through the `jfn_input_dispatch_*` extern "C"
 //! entry points implemented in `src/input/src/lib.rs` (active-browser
 //! lookup, hotkey classification, CEF forwarding).
 
+use parking_lot::Mutex;
 use std::ffi::{c_int, c_void};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use objc2::rc::Retained;
@@ -48,8 +48,7 @@ const MOUSE_BTN_LEFT: u32 = 0x110;
 const MOUSE_BTN_RIGHT: u32 = 0x111;
 const MOUSE_BTN_MIDDLE: u32 = 0x112;
 
-// cef_cursor_type_t ordinals.
-const CT_NONE: i32 = 37;
+use jfn_platform_abi::cursor::*;
 
 // NSEventModifierFlags (NSEvent.h).
 const NSEVENT_MOD_SHIFT: u64 = 1 << 17;
@@ -72,55 +71,17 @@ const NS_TRACKING_MOUSE_ENTERED_AND_EXITED: u64 = 0x01;
 const NS_TRACKING_ACTIVE_IN_KEY_WINDOW: u64 = 0x20;
 const NS_TRACKING_IN_VISIBLE_RECT: u64 = 0x200;
 
-// NSAutoresizingMask.
-const NS_VIEW_WIDTH_SIZABLE: u64 = 2;
-const NS_VIEW_HEIGHT_SIZABLE: u64 = 16;
-#[allow(dead_code)]
-pub(crate) const NS_VIEW_AUTORESIZE_FLEXIBLE: u64 = NS_VIEW_WIDTH_SIZABLE | NS_VIEW_HEIGHT_SIZABLE;
+// =====================================================================
+// Cross-crate entry points
+// =====================================================================
 
-// =====================================================================
-// extern "C" dispatch entry points (src/input/src/lib.rs)
-// =====================================================================
+use jfn_input::{
+    jfn_input_dispatch_char_sys, jfn_input_dispatch_history_nav, jfn_input_dispatch_key_full,
+    jfn_input_dispatch_keyboard_focus, jfn_input_dispatch_mouse_button,
+    jfn_input_dispatch_mouse_move, jfn_input_dispatch_scroll_precise,
+};
 
 unsafe extern "C" {
-    fn jfn_input_dispatch_mouse_move(x: i32, y: i32, mods: u32, leave: c_int);
-    fn jfn_input_dispatch_mouse_button(
-        button_code: u32,
-        pressed: c_int,
-        x: i32,
-        y: i32,
-        mods: u32,
-    );
-    fn jfn_input_dispatch_scroll_precise(
-        x: i32,
-        y: i32,
-        dx: i32,
-        dy: i32,
-        mods: u32,
-        precise: c_int,
-    );
-    fn jfn_input_dispatch_history_nav(forward: c_int);
-    fn jfn_input_dispatch_keyboard_focus(gained: c_int);
-    fn jfn_input_dispatch_char_sys(codepoint: u32, mods: u32, native_code: u32, is_system_key: c_int);
-    fn jfn_input_dispatch_key_full(
-        pressed: c_int,
-        windows_key_code: i32,
-        native_key_code: i32,
-        modifiers: u32,
-        character: u16,
-        unmodified_character: u16,
-        is_system_key: c_int,
-    );
-
-    // jfn-cef layer ops for the Edit menu items (cut/copy/paste/...).
-    fn jfn_browsers_active() -> *const c_void;
-    fn jfn_cef_layer_undo(h: *const c_void);
-    fn jfn_cef_layer_redo(h: *const c_void);
-    fn jfn_cef_layer_cut(h: *const c_void);
-    fn jfn_cef_layer_copy(h: *const c_void);
-    fn jfn_cef_layer_paste(h: *const c_void);
-    fn jfn_cef_layer_select_all(h: *const c_void);
-
     static _dispatch_main_q: c_void;
     fn dispatch_async_f(
         queue: *mut c_void,
@@ -131,7 +92,7 @@ unsafe extern "C" {
 
 #[inline]
 fn dispatch_get_main_queue() -> *mut c_void {
-    unsafe { std::ptr::addr_of!(_dispatch_main_q) as *mut c_void }
+    std::ptr::addr_of!(_dispatch_main_q) as *mut c_void
 }
 
 // =====================================================================
@@ -155,31 +116,77 @@ fn ns_to_cef_modifiers(flags: u64) -> u32 {
     m
 }
 
-/// Windows VK code for CefKeyEvent.windows_key_code. Mirrors the C++ table.
+/// Windows VK code for CefKeyEvent.windows_key_code.
 fn ns_keycode_to_vkey(kc: u16) -> i32 {
     match kc {
         // Letters (VK_A = 0x41 .. VK_Z = 0x5A)
-        0x00 => b'A' as i32, 0x0B => b'B' as i32, 0x08 => b'C' as i32, 0x02 => b'D' as i32,
-        0x0E => b'E' as i32, 0x03 => b'F' as i32, 0x05 => b'G' as i32, 0x04 => b'H' as i32,
-        0x22 => b'I' as i32, 0x26 => b'J' as i32, 0x28 => b'K' as i32, 0x25 => b'L' as i32,
-        0x2E => b'M' as i32, 0x2D => b'N' as i32, 0x1F => b'O' as i32, 0x23 => b'P' as i32,
-        0x0C => b'Q' as i32, 0x0F => b'R' as i32, 0x01 => b'S' as i32, 0x11 => b'T' as i32,
-        0x20 => b'U' as i32, 0x09 => b'V' as i32, 0x0D => b'W' as i32, 0x07 => b'X' as i32,
-        0x10 => b'Y' as i32, 0x06 => b'Z' as i32,
+        0x00 => b'A' as i32,
+        0x0B => b'B' as i32,
+        0x08 => b'C' as i32,
+        0x02 => b'D' as i32,
+        0x0E => b'E' as i32,
+        0x03 => b'F' as i32,
+        0x05 => b'G' as i32,
+        0x04 => b'H' as i32,
+        0x22 => b'I' as i32,
+        0x26 => b'J' as i32,
+        0x28 => b'K' as i32,
+        0x25 => b'L' as i32,
+        0x2E => b'M' as i32,
+        0x2D => b'N' as i32,
+        0x1F => b'O' as i32,
+        0x23 => b'P' as i32,
+        0x0C => b'Q' as i32,
+        0x0F => b'R' as i32,
+        0x01 => b'S' as i32,
+        0x11 => b'T' as i32,
+        0x20 => b'U' as i32,
+        0x09 => b'V' as i32,
+        0x0D => b'W' as i32,
+        0x07 => b'X' as i32,
+        0x10 => b'Y' as i32,
+        0x06 => b'Z' as i32,
         // Digits (VK_0 = 0x30 .. VK_9 = 0x39)
-        0x1D => b'0' as i32, 0x12 => b'1' as i32, 0x13 => b'2' as i32, 0x14 => b'3' as i32,
-        0x15 => b'4' as i32, 0x17 => b'5' as i32, 0x16 => b'6' as i32, 0x1A => b'7' as i32,
-        0x1C => b'8' as i32, 0x19 => b'9' as i32,
+        0x1D => b'0' as i32,
+        0x12 => b'1' as i32,
+        0x13 => b'2' as i32,
+        0x14 => b'3' as i32,
+        0x15 => b'4' as i32,
+        0x17 => b'5' as i32,
+        0x16 => b'6' as i32,
+        0x1A => b'7' as i32,
+        0x1C => b'8' as i32,
+        0x19 => b'9' as i32,
         // Function keys (VK_F1 = 0x70 .. VK_F12 = 0x7B)
-        0x7A => 0x70, 0x78 => 0x71, 0x63 => 0x72, 0x76 => 0x73,
-        0x60 => 0x74, 0x61 => 0x75, 0x62 => 0x76, 0x64 => 0x77,
-        0x65 => 0x78, 0x6D => 0x79, 0x67 => 0x7A, 0x6F => 0x7B,
+        0x7A => 0x70,
+        0x78 => 0x71,
+        0x63 => 0x72,
+        0x76 => 0x73,
+        0x60 => 0x74,
+        0x61 => 0x75,
+        0x62 => 0x76,
+        0x64 => 0x77,
+        0x65 => 0x78,
+        0x6D => 0x79,
+        0x67 => 0x7A,
+        0x6F => 0x7B,
         // Navigation
-        0x7B => 0x25, 0x7E => 0x26, 0x7C => 0x27, 0x7D => 0x28,
-        0x73 => 0x24, 0x77 => 0x23, 0x74 => 0x21, 0x79 => 0x22,
+        0x7B => 0x25,
+        0x7E => 0x26,
+        0x7C => 0x27,
+        0x7D => 0x28,
+        0x73 => 0x24,
+        0x77 => 0x23,
+        0x74 => 0x21,
+        0x79 => 0x22,
         // Editing
-        0x30 => 0x09, 0x24 => 0x0D, 0x35 => 0x1B, 0x33 => 0x08,
-        0x75 => 0x2E, 0x31 => 0x20, 0x72 => 0x2D,
+        0x30 => 0x09,
+        0x24 => 0x0D,
+        0x35 => 0x1B,
+        0x33 => 0x08,
+        0x75 => 0x2E,
+        0x31 => 0x20,
+        0x72 => 0x2D,
         // Modifiers
         0x38 | 0x3C => 0x10,
         0x3B | 0x3E => 0x11,
@@ -187,9 +194,17 @@ fn ns_keycode_to_vkey(kc: u16) -> i32 {
         0x36 | 0x37 => 0x5B,
         0x39 => 0x14,
         // OEM punctuation
-        0x29 => 0xBA, 0x18 => 0xBB, 0x2B => 0xBC, 0x1B => 0xBD,
-        0x2F => 0xBE, 0x2C => 0xBF, 0x32 => 0xC0, 0x21 => 0xDB,
-        0x2A => 0xDC, 0x1E => 0xDD, 0x27 => 0xDE,
+        0x29 => 0xBA,
+        0x18 => 0xBB,
+        0x2B => 0xBC,
+        0x1B => 0xBD,
+        0x2F => 0xBE,
+        0x2C => 0xBF,
+        0x32 => 0xC0,
+        0x21 => 0xDB,
+        0x2A => 0xDC,
+        0x1E => 0xDD,
+        0x27 => 0xDE,
         _ => 0,
     }
 }
@@ -209,22 +224,22 @@ static G_MOUSE_BUTTON_MODIFIERS: AtomicU32 = AtomicU32::new(0);
 unsafe fn ns_cursor_for(ct: i32) -> *mut AnyObject {
     let cls = objc2::class!(NSCursor);
     let sel: Sel = match ct {
-        1 => sel!(crosshairCursor),        // CT_CROSS
-        2 => sel!(pointingHandCursor),     // CT_HAND
-        3 => sel!(IBeamCursor),            // CT_IBEAM
-        30 => sel!(IBeamCursorForVerticalLayout), // CT_VERTICALTEXT
-        6 => sel!(resizeRightCursor),      // CT_EASTRESIZE
-        13 => sel!(resizeLeftCursor),      // CT_WESTRESIZE
-        7 => sel!(resizeUpCursor),         // CT_NORTHRESIZE
-        10 => sel!(resizeDownCursor),      // CT_SOUTHRESIZE
-        14 | 19 => sel!(resizeUpDownCursor),     // CT_NORTHSOUTHRESIZE / CT_ROWRESIZE
-        15 | 18 => sel!(resizeLeftRightCursor),  // CT_EASTWESTRESIZE / CT_COLUMNRESIZE
-        29 | 41 => sel!(openHandCursor),         // CT_MOVE / CT_GRAB
-        42 => sel!(closedHandCursor),            // CT_GRABBING
-        35 | 38 => sel!(operationNotAllowedCursor), // CT_NODROP / CT_NOTALLOWED
-        36 => sel!(dragCopyCursor),              // CT_COPY
-        33 => sel!(dragLinkCursor),              // CT_ALIAS
-        32 => sel!(contextualMenuCursor),        // CT_CONTEXTMENU
+        CT_CROSS => sel!(crosshairCursor),
+        CT_HAND => sel!(pointingHandCursor),
+        CT_IBEAM => sel!(IBeamCursor),
+        CT_VERTICALTEXT => sel!(IBeamCursorForVerticalLayout),
+        CT_EASTRESIZE => sel!(resizeRightCursor),
+        CT_WESTRESIZE => sel!(resizeLeftCursor),
+        CT_NORTHRESIZE => sel!(resizeUpCursor),
+        CT_SOUTHRESIZE => sel!(resizeDownCursor),
+        CT_NORTHSOUTHRESIZE | CT_ROWRESIZE => sel!(resizeUpDownCursor),
+        CT_EASTWESTRESIZE | CT_COLUMNRESIZE => sel!(resizeLeftRightCursor),
+        CT_MOVE | CT_GRAB => sel!(openHandCursor),
+        CT_GRABBING => sel!(closedHandCursor),
+        CT_NODROP | CT_NOTALLOWED => sel!(operationNotAllowedCursor),
+        CT_COPY => sel!(dragCopyCursor),
+        CT_ALIAS => sel!(dragLinkCursor),
+        CT_CONTEXTMENU => sel!(contextualMenuCursor),
         _ => sel!(arrowCursor),
     };
     unsafe { msg_send![cls, performSelector: sel] }
@@ -258,11 +273,14 @@ unsafe extern "C" fn cursor_trampoline(_ctx: *mut c_void) {
 }
 
 /// Platform::set_cursor — safe to call from any thread.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_input_macos_set_cursor(t: c_int) {
+pub fn jfn_input_macos_set_cursor(t: c_int) {
     G_PENDING_CURSOR.store(t, Ordering::SeqCst);
     unsafe {
-        dispatch_async_f(dispatch_get_main_queue(), std::ptr::null_mut(), cursor_trampoline);
+        dispatch_async_f(
+            dispatch_get_main_queue(),
+            std::ptr::null_mut(),
+            cursor_trampoline,
+        );
     }
 }
 
@@ -299,7 +317,7 @@ unsafe extern "C" fn scroll_flush_trampoline(_ctx: *mut c_void) {
 
 fn flush_scroll_accumulator() {
     let (dx, dy, x, y, mods, precise) = {
-        let mut s = SCROLL.lock().unwrap();
+        let mut s = SCROLL.lock();
         s.flush_scheduled = false;
         if !s.pending {
             return;
@@ -336,9 +354,7 @@ fn flush_scroll_accumulator() {
     if dx == 0 && dy == 0 {
         return;
     }
-    unsafe {
-        jfn_input_dispatch_scroll_precise(x, y, dx, dy, mods, if precise { 1 } else { 0 });
-    }
+    jfn_input_dispatch_scroll_precise(x, y, dx, dy, mods, if precise { 1 } else { 0 });
 }
 
 // =====================================================================
@@ -370,7 +386,7 @@ define_class!(
         fn update_tracking_areas(&self) {
             unsafe {
                 let _: () = msg_send![super(self), updateTrackingAreas];
-                let mut slot = self.ivars().tracking_area.lock().unwrap();
+                let mut slot = self.ivars().tracking_area.lock();
                 if let Some(old) = slot.take() {
                     let _: () = msg_send![self, removeTrackingArea: &*old];
                 }
@@ -416,7 +432,7 @@ define_class!(
         fn other_mouse_down(&self, event: &AnyObject) {
             let n: isize = unsafe { msg_send![event, buttonNumber] };
             if n == NS_MOUSE_BUTTON_BACK || n == NS_MOUSE_BUTTON_FORWARD {
-                unsafe { jfn_input_dispatch_history_nav(if n == NS_MOUSE_BUTTON_FORWARD { 1 } else { 0 }) };
+                jfn_input_dispatch_history_nav(if n == NS_MOUSE_BUTTON_FORWARD { 1 } else { 0 });
                 return;
             }
             dispatch_mouse_button(self, event, MOUSE_BTN_MIDDLE, true);
@@ -472,7 +488,7 @@ define_class!(
             let mods_raw: u64 = unsafe { msg_send![event, modifierFlags] };
             let mut sched = false;
             {
-                let mut s = SCROLL.lock().unwrap();
+                let mut s = SCROLL.lock();
                 s.x = loc.x as i32;
                 s.y = loc.y as i32;
                 s.mods = ns_to_cef_modifiers(mods_raw);
@@ -508,9 +524,7 @@ define_class!(
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &AnyObject) {
             let (vkey, mods, kc, ch, ch_nomod) = key_event_fields(event);
-            unsafe {
-                jfn_input_dispatch_key_full(1, vkey, kc as i32, mods, ch, ch_nomod, 0);
-            }
+            jfn_input_dispatch_key_full(1, vkey, kc as i32, mods, ch, ch_nomod, 0);
             // Forward typed characters for text input — paired CHAR event only
             // for printable chars + Return.
             if ch != 0 {
@@ -518,9 +532,7 @@ define_class!(
                 let forward = c == 0x0d
                     || (c >= 0x20 && c != 0x7f && !((0xF700..=0xF7FF).contains(&c)));
                 if forward {
-                    unsafe {
-                        jfn_input_dispatch_char_sys(c as u32, mods, kc as u32, 0);
-                    }
+                    jfn_input_dispatch_char_sys(c as u32, mods, kc as u32, 0);
                 }
             }
         }
@@ -528,9 +540,7 @@ define_class!(
         #[unsafe(method(keyUp:))]
         fn key_up(&self, event: &AnyObject) {
             let (vkey, mods, kc, ch, ch_nomod) = key_event_fields(event);
-            unsafe {
-                jfn_input_dispatch_key_full(0, vkey, kc as i32, mods, ch, ch_nomod, 0);
-            }
+            jfn_input_dispatch_key_full(0, vkey, kc as i32, mods, ch, ch_nomod, 0);
         }
 
         #[unsafe(method(flagsChanged:))]
@@ -551,20 +561,18 @@ define_class!(
             let pressed = if flag != 0 { (raw_flags & flag) != 0 } else { false };
             let vkey = ns_keycode_to_vkey(kc);
             let mods = ns_to_cef_modifiers(raw_flags);
-            unsafe {
-                jfn_input_dispatch_key_full(if pressed { 1 } else { 0 }, vkey, kc as i32, mods, 0, 0, 0);
-            }
+            jfn_input_dispatch_key_full(if pressed { 1 } else { 0 }, vkey, kc as i32, mods, 0, 0, 0);
         }
 
         // ---- Focus ----
         #[unsafe(method(becomeFirstResponder))]
         fn become_first_responder(&self) -> Bool {
-            unsafe { jfn_input_dispatch_keyboard_focus(1) };
+            jfn_input_dispatch_keyboard_focus(1);
             unsafe { msg_send![super(self), becomeFirstResponder] }
         }
         #[unsafe(method(resignFirstResponder))]
         fn resign_first_responder(&self) -> Bool {
-            unsafe { jfn_input_dispatch_keyboard_focus(0) };
+            jfn_input_dispatch_keyboard_focus(0);
             unsafe { msg_send![super(self), resignFirstResponder] }
         }
 
@@ -573,33 +581,39 @@ define_class!(
         // these. Forward each to the active CEF browser's focused frame.
         #[unsafe(method(undo:))]
         fn undo_action(&self, _sender: *mut AnyObject) {
-            let l = unsafe { jfn_browsers_active() };
-            if !l.is_null() { unsafe { jfn_cef_layer_undo(l) } }
+            if let Some(b) = jfn_platform_abi::browser_bridge() {
+                b.undo();
+            }
         }
         #[unsafe(method(redo:))]
         fn redo_action(&self, _sender: *mut AnyObject) {
-            let l = unsafe { jfn_browsers_active() };
-            if !l.is_null() { unsafe { jfn_cef_layer_redo(l) } }
+            if let Some(b) = jfn_platform_abi::browser_bridge() {
+                b.redo();
+            }
         }
         #[unsafe(method(cut:))]
         fn cut_action(&self, _sender: *mut AnyObject) {
-            let l = unsafe { jfn_browsers_active() };
-            if !l.is_null() { unsafe { jfn_cef_layer_cut(l) } }
+            if let Some(b) = jfn_platform_abi::browser_bridge() {
+                b.cut();
+            }
         }
         #[unsafe(method(copy:))]
         fn copy_action(&self, _sender: *mut AnyObject) {
-            let l = unsafe { jfn_browsers_active() };
-            if !l.is_null() { unsafe { jfn_cef_layer_copy(l) } }
+            if let Some(b) = jfn_platform_abi::browser_bridge() {
+                b.copy();
+            }
         }
         #[unsafe(method(paste:))]
         fn paste_action(&self, _sender: *mut AnyObject) {
-            let l = unsafe { jfn_browsers_active() };
-            if !l.is_null() { unsafe { jfn_cef_layer_paste(l) } }
+            if let Some(b) = jfn_platform_abi::browser_bridge() {
+                b.paste();
+            }
         }
         #[unsafe(method(selectAll:))]
         fn select_all_action(&self, _sender: *mut AnyObject) {
-            let l = unsafe { jfn_browsers_active() };
-            if !l.is_null() { unsafe { jfn_cef_layer_select_all(l) } }
+            if let Some(b) = jfn_platform_abi::browser_bridge() {
+                b.select_all();
+            }
         }
     }
 );
@@ -626,24 +640,20 @@ fn dispatch_mouse_button(view: &InputView, event: &AnyObject, button_code: u32, 
     let raw_flags: u64 = unsafe { msg_send![event, modifierFlags] };
     let _click: isize = unsafe { msg_send![event, clickCount] };
     let mods = ns_to_cef_modifiers(raw_flags) | next;
-    unsafe {
-        jfn_input_dispatch_mouse_button(
-            button_code,
-            if pressed { 1 } else { 0 },
-            loc.x as i32,
-            loc.y as i32,
-            mods,
-        );
-    }
+    jfn_input_dispatch_mouse_button(
+        button_code,
+        if pressed { 1 } else { 0 },
+        loc.x as i32,
+        loc.y as i32,
+        mods,
+    );
 }
 
 fn dispatch_mouse_move(view: &InputView, event: &AnyObject, leave: bool) {
     let loc = mouse_loc_in_view(view, event);
     let raw_flags: u64 = unsafe { msg_send![event, modifierFlags] };
     let mods = ns_to_cef_modifiers(raw_flags) | G_MOUSE_BUTTON_MODIFIERS.load(Ordering::SeqCst);
-    unsafe {
-        jfn_input_dispatch_mouse_move(loc.x as i32, loc.y as i32, mods, if leave { 1 } else { 0 });
-    }
+    jfn_input_dispatch_mouse_move(loc.x as i32, loc.y as i32, mods, if leave { 1 } else { 0 });
 }
 
 /// Returns (windows_key_code, modifiers, native_keycode, character, unmodified_character).
@@ -672,7 +682,13 @@ fn key_event_fields(event: &AnyObject) -> (i32, u32, u16, u16, u16) {
             }
         }
     }
-    (ns_keycode_to_vkey(kc), ns_to_cef_modifiers(raw_flags), kc, ch, ch_nomod)
+    (
+        ns_keycode_to_vkey(kc),
+        ns_to_cef_modifiers(raw_flags),
+        kc,
+        ch,
+        ch_nomod,
+    )
 }
 
 // =====================================================================
@@ -682,11 +698,13 @@ fn key_event_fields(event: &AnyObject) -> (i32, u32, u16, u16, u16) {
 
 /// Returns a +1-retained NSView pointer (transfers ownership to the
 /// caller). The caller adds it to the window's content view subtree.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_input_macos_create_view() -> *mut c_void {
+pub fn jfn_input_macos_create_view() -> *mut c_void {
     let zero_rect = NSRect {
         origin: NSPoint { x: 0.0, y: 0.0 },
-        size: NSSize { width: 0.0, height: 0.0 },
+        size: NSSize {
+            width: 0.0,
+            height: 0.0,
+        },
     };
     let view = InputView::alloc().set_ivars(ViewIvars::default());
     let view: Retained<InputView> = unsafe { msg_send![super(view), initWithFrame: zero_rect] };

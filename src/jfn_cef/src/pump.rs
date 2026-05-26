@@ -5,17 +5,14 @@
 //! immediate work; a `CFRunLoopTimer` services delayed work; both are
 //! installed in the main runloop's common modes.
 //!
-//! Ported from `src/cef/macos_pump.cpp` — the wedge-recovery heuristic is
-//! preserved verbatim because it's tied to a specific CEF version's
-//! `WorkDeduplicator` internals and was validated in the C++ revision.
+//! The wedge-recovery heuristic is preserved verbatim because it's tied to
+//! a specific CEF version's `WorkDeduplicator` internals.
 
 #![cfg(target_os = "macos")]
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::time::Instant;
-
-use crate::bridge;
 
 // ----- CoreFoundation FFI ---------------------------------------------------
 
@@ -123,10 +120,10 @@ const CEF_MAX_TIME_SLICE_MS: f64 = 10.0;
 
 fn pump_drain(trigger: &str) {
     if PUMP_SHUTDOWN.load(Ordering::Acquire) {
-        if bridge::log_enabled(bridge::LOG_CEF, bridge::LEVEL_DEBUG) {
-            bridge::log(
-                bridge::LOG_CEF,
-                bridge::LEVEL_DEBUG,
+        if jfn_logging::log_enabled(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_DEBUG) {
+            jfn_logging::log(
+                jfn_logging::CATEGORY_CEF,
+                jfn_logging::LEVEL_DEBUG,
                 &format!("[PUMP] drain({trigger}) skipped (shutdown)"),
             );
         }
@@ -166,9 +163,9 @@ unsafe extern "C" fn delayed_timer_fire(_timer: CFRunLoopTimerRef, _info: *mut c
 // ----- Public API -----------------------------------------------------------
 
 pub(crate) fn init() {
-    bridge::log(
-        bridge::LOG_CEF,
-        bridge::LEVEL_INFO,
+    jfn_logging::log(
+        jfn_logging::CATEGORY_CEF,
+        jfn_logging::LEVEL_INFO,
         "[PUMP] init: installing CFRunLoopSource + CFRunLoopTimer",
     );
 
@@ -209,10 +206,10 @@ pub(crate) fn init() {
 
 pub(crate) fn on_schedule(delay_ms: i64) {
     if PUMP_SHUTDOWN.load(Ordering::Acquire) {
-        if bridge::log_enabled(bridge::LOG_CEF, bridge::LEVEL_DEBUG) {
-            bridge::log(
-                bridge::LOG_CEF,
-                bridge::LEVEL_DEBUG,
+        if jfn_logging::log_enabled(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_DEBUG) {
+            jfn_logging::log(
+                jfn_logging::CATEGORY_CEF,
+                jfn_logging::LEVEL_DEBUG,
                 &format!("[PUMP] on_schedule({delay_ms}) SKIP(shutdown)"),
             );
         }
@@ -243,9 +240,9 @@ pub(crate) fn on_schedule(delay_ms: i64) {
 }
 
 pub(crate) fn shutdown() {
-    bridge::log(
-        bridge::LOG_CEF,
-        bridge::LEVEL_INFO,
+    jfn_logging::log(
+        jfn_logging::CATEGORY_CEF,
+        jfn_logging::LEVEL_INFO,
         &format!(
             "[PUMP] shutdown: sched_imm={} sched_delayed={} source_fired={} timer_fired={} dmlw_calls={}",
             SCHED_IMM_CALLS.load(Ordering::Relaxed),

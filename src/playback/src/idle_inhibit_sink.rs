@@ -1,14 +1,13 @@
 //! Idle-inhibit sink. Watches phase + media_type transitions and drives
-//! the platform idle-inhibit level via a reverse-FFI callback the C++
-//! side installs at startup (wired to `g_platform.set_idle_inhibit`).
-//!
-//! Replaces `src/playback/sinks/idle_inhibit_sink.cpp`.
+//! the platform idle-inhibit level via the registered callback wired to
+//! `g_platform.set_idle_inhibit`.
 
-use std::sync::{Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::OnceLock;
 
 use crate::types::{MediaType, PlaybackEvent, PlaybackEventKind, PlaybackPhase, PlaybackSnapshot};
 
-// Mirrors C++ `enum class IdleInhibitLevel { None, System, Display }`.
+// IdleInhibitLevel: None, System, Display.
 const LEVEL_NONE: u32 = 0;
 const LEVEL_SYSTEM: u32 = 1;
 const LEVEL_DISPLAY: u32 = 2;
@@ -21,13 +20,12 @@ fn cb_slot() -> &'static Mutex<Option<SetCb>> {
 }
 
 /// Install the platform idle-inhibit setter. `cb == None` disables the sink.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_playback_set_idle_inhibit_handler(cb: Option<SetCb>) {
-    *cb_slot().lock().unwrap() = cb;
+pub fn jfn_playback_set_idle_inhibit_handler(cb: Option<SetCb>) {
+    *cb_slot().lock() = cb;
 }
 
 fn apply(snap: &PlaybackSnapshot) {
-    let Some(cb) = *cb_slot().lock().unwrap() else {
+    let Some(cb) = *cb_slot().lock() else {
         return;
     };
     let level = if snap.phase != PlaybackPhase::Playing {

@@ -17,14 +17,21 @@
 //! but the caller overrides that env to OUR socket so mpv connects to us. We
 //! must capture the original `WAYLAND_DISPLAY` here at `start` (before any
 //! override) and pass it explicitly via `with_server_display_name`.
+//!
+//! The whole crate is gated to Linux: `wl-proxy` is a Wayland-only dependency,
+//! and nothing references this crate off-Linux (jfn_rust pulls it in only under
+//! its `cfg(target_os = "linux")` deps, and `jfn-wayland` is Linux-only). Off
+//! Linux this is an empty rlib, which keeps `cargo --workspace` uniform.
+#![cfg(target_os = "linux")]
 
+use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::CString;
 use std::os::fd::OwnedFd;
 use std::os::raw::{c_char, c_int};
 use std::rc::Rc;
-use std::sync::{Mutex, mpsc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -102,7 +109,7 @@ static PENDING: Mutex<PendingConfigure> = Mutex::new(PendingConfigure {
 });
 
 fn fire_configure() {
-    let p = PENDING.lock().unwrap();
+    let p = PENDING.lock();
     if !p.have_configure {
         return;
     }
@@ -111,7 +118,7 @@ fn fire_configure() {
     let ph = ((p.logical_h as i64 * p.scale_120 as i64 + 60) / 120) as c_int;
     let fs = p.fullscreen;
     drop(p);
-    if let Some(cb) = *CONFIGURE_CB.lock().unwrap() {
+    if let Some(cb) = *CONFIGURE_CB.lock() {
         cb(pw, ph, fs);
     }
 }
@@ -126,8 +133,7 @@ fn fire_configure() {
 /// channel before entering its blocking accept loop.
 ///
 /// Returns null on failure.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_wlproxy_start() -> *mut Proxy {
+pub fn jfn_wlproxy_start() -> *mut Proxy {
     // Capture upstream BEFORE the caller overrides WAYLAND_DISPLAY. Per-client
     // States need this so they don't connect to our own socket.
     let upstream = std::env::var("WAYLAND_DISPLAY").ok();
@@ -166,8 +172,7 @@ pub extern "C" fn jfn_wlproxy_start() -> *mut Proxy {
 /// # Safety
 /// `p` must be null or a pointer previously returned by `jfn_wlproxy_start`
 /// that has not yet been passed to `jfn_wlproxy_stop`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_wlproxy_display_name(p: *const Proxy) -> *const c_char {
+pub unsafe fn jfn_wlproxy_display_name(p: *const Proxy) -> *const c_char {
     if p.is_null() {
         return std::ptr::null();
     }
@@ -180,8 +185,7 @@ pub unsafe extern "C" fn jfn_wlproxy_display_name(p: *const Proxy) -> *const c_c
 /// # Safety
 /// `p` must be null or a pointer previously returned by `jfn_wlproxy_start`.
 /// Each non-null pointer may only be passed here once.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_wlproxy_stop(p: *mut Proxy) {
+pub unsafe fn jfn_wlproxy_stop(p: *mut Proxy) {
     if p.is_null() {
         return;
     }
@@ -197,9 +201,8 @@ pub unsafe extern "C" fn jfn_wlproxy_stop(p: *mut Proxy) {
 /// pixels (scaled by the current `scale_120 / 120` factor).
 ///
 /// The event still forwards to mpv after the callback runs.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_wlproxy_set_configure_callback(cb: ConfigureCb) {
-    *CONFIGURE_CB.lock().unwrap() = Some(cb);
+pub fn jfn_wlproxy_set_configure_callback(cb: ConfigureCb) {
+    *CONFIGURE_CB.lock() = Some(cb);
 }
 
 /// Register the wp_fractional_scale_v1.preferred_scale callback.
@@ -207,28 +210,23 @@ pub extern "C" fn jfn_wlproxy_set_configure_callback(cb: ConfigureCb) {
 /// Argument is the scale numerator over `WAYLAND_SCALE_FACTOR=120` (so 120 =
 /// 1.0x, 180 = 1.5x, 240 = 2.0x). Fires once whenever the compositor sends a
 /// new preferred scale for the toplevel's surface.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_wlproxy_set_scale_callback(cb: ScaleCb) {
-    *SCALE_CB.lock().unwrap() = Some(cb);
+pub fn jfn_wlproxy_set_scale_callback(cb: ScaleCb) {
+    *SCALE_CB.lock() = Some(cb);
 }
 
 /// Queue an xdg_toplevel.set_fullscreen / unset_fullscreen request. Applied
 /// from the proxy's per-client thread on its next dispatch iteration.
-#[unsafe(no_mangle)]
 pub extern "C" fn jfn_wlproxy_set_fullscreen(enable: c_int) {
     COMMANDS
         .lock()
-        .unwrap()
         .push_back(HostCommand::SetFullscreen(enable != 0));
 }
 
 /// Queue an xdg_toplevel.set_maximized / unset_maximized request. Applied
 /// from the proxy's per-client thread on its next dispatch iteration.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_wlproxy_set_maximized(enable: c_int) {
+pub fn jfn_wlproxy_set_maximized(enable: c_int) {
     COMMANDS
         .lock()
-        .unwrap()
         .push_back(HostCommand::SetMaximized(enable != 0));
 }
 
@@ -312,7 +310,7 @@ fn run_client(socket: OwnedFd, upstream: Option<String>) {
 }
 
 fn drain_host_commands() {
-    let cmds: Vec<HostCommand> = COMMANDS.lock().unwrap().drain(..).collect();
+    let cmds: Vec<HostCommand> = COMMANDS.lock().drain(..).collect();
     if cmds.is_empty() {
         return;
     }
@@ -386,8 +384,8 @@ impl WpFractionalScaleManagerV1Handler for FracScaleMgrH {
 struct FracScaleH;
 impl WpFractionalScaleV1Handler for FracScaleH {
     fn handle_preferred_scale(&mut self, slf: &Rc<WpFractionalScaleV1>, scale: u32) {
-        PENDING.lock().unwrap().scale_120 = scale;
-        if let Some(cb) = *SCALE_CB.lock().unwrap() {
+        PENDING.lock().scale_120 = scale;
+        if let Some(cb) = *SCALE_CB.lock() {
             cb(scale as c_int);
         }
         fire_configure();
@@ -416,8 +414,8 @@ impl XdgSurfaceHandler for SurfaceH {
         slf.send_get_toplevel(id);
     }
 
-    // Eat mpv's window-geometry hint. On Wayland the host (C++) is the sole
-    // authority for window state; mpv shouldn't be telling the compositor
+    // Eat mpv's window-geometry hint. The host is the sole authority for
+    // window state on Wayland; mpv shouldn't be telling the compositor
     // anything about geometry.
     fn handle_set_window_geometry(
         &mut self,
@@ -433,7 +431,7 @@ impl XdgSurfaceHandler for SurfaceH {
 struct ToplevelH;
 impl XdgToplevelHandler for ToplevelH {
     // ===== Eat mpv's state-change requests =====
-    // C++ drives all window state via jfn_wlproxy_set_fullscreen /
+    // The host drives all window state via jfn_wlproxy_set_fullscreen /
     // set_maximized (which fire send_* from the proxy directly). mpv's
     // outgoing state requests are dropped so they can't race the host.
 
@@ -457,7 +455,7 @@ impl XdgToplevelHandler for ToplevelH {
             }
         }
         {
-            let mut p = PENDING.lock().unwrap();
+            let mut p = PENDING.lock();
             p.have_configure = true;
             p.logical_w = width;
             p.logical_h = height;

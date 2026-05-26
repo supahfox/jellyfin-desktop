@@ -11,7 +11,7 @@
 //! `protocols/server-decoration-palette.xml` via `build.rs`; there is no
 //! upstream Rust crate for this KDE-specific protocol.
 //!
-//! Lifecycle (driven from C++ wayland.cpp):
+//! Lifecycle:
 //!   1. `jfn_wl_kde_palette_attach(display, parent)` — opens a short-lived
 //!      Wayland registry pass on the supplied (mpv-owned) display, binds
 //!      the palette manager, creates the per-window palette object, and
@@ -25,12 +25,12 @@
 //!      palette object itself is dropped atomically by KWin when the
 //!      window goes away.
 
+use parking_lot::Mutex;
 use std::ffi::{CString, c_char, c_void};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use wayland_backend::client::{Backend, ObjectId};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
@@ -110,9 +110,8 @@ fn write_color_scheme(r: u8, g: u8, b: u8, path: &std::path::Path) -> std::io::R
     let bg = format!("{},{},{}", r, g, b);
 
     // BT.709 luminance — choose readable foreground.
-    let lum = 0.2126 * (r as f64 / 255.0)
-        + 0.7152 * (g as f64 / 255.0)
-        + 0.0722 * (b as f64 / 255.0);
+    let lum =
+        0.2126 * (r as f64 / 255.0) + 0.7152 * (g as f64 / 255.0) + 0.0722 * (b as f64 / 255.0);
     let active_fg = if lum < 0.5 { "252,252,252" } else { "35,38,41" };
     let inactive_fg = if lum < 0.5 { "126,126,126" } else { "35,38,41" };
 
@@ -133,7 +132,7 @@ fn make_colors_dir() -> Option<PathBuf> {
     let mut dir = PathBuf::from(runtime);
     dir.push("jellyfin-desktop");
     if let Err(e) = fs::create_dir_all(&dir) {
-        log::warn!("kde_palette: mkdir {} failed: {}", dir.display(), e);
+        tracing::warn!("kde_palette: mkdir {} failed: {}", dir.display(), e);
         return None;
     }
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
@@ -145,18 +144,15 @@ fn make_colors_dir() -> Option<PathBuf> {
 /// the protocol is not advertised (non-KWin compositor) or any wire step
 /// fails. Safe to call once during wl_init.
 ///
-/// SAFETY: `display` must be a live `*mut wl_display`; `parent_surface`
-/// must be a live `*mut wl_proxy` referring to a `wl_surface` on it.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_wl_kde_palette_attach(
-    display: *mut c_void,
-    parent_surface: *mut c_void,
-) -> bool {
+/// # Safety
+/// `display` must be a live `*mut wl_display`; `parent_surface` must be
+/// a live `*mut wl_proxy` referring to a `wl_surface` on it.
+pub unsafe fn jfn_wl_kde_palette_attach(display: *mut c_void, parent_surface: *mut c_void) -> bool {
     if display.is_null() || parent_surface.is_null() {
         return false;
     }
-    if STATE.lock().unwrap().is_some() {
-        log::warn!("kde_palette: attach called twice");
+    if STATE.lock().is_some() {
+        tracing::warn!("kde_palette: attach called twice");
         return false;
     }
 
@@ -166,7 +162,7 @@ pub unsafe extern "C" fn jfn_wl_kde_palette_attach(
     let (globals, mut queue) = match registry_queue_init::<RegistrySink>(&conn) {
         Ok(p) => p,
         Err(e) => {
-            log::warn!("kde_palette: registry init: {e}");
+            tracing::warn!("kde_palette: registry init: {e}");
             return false;
         }
     };
@@ -175,25 +171,24 @@ pub unsafe extern "C" fn jfn_wl_kde_palette_attach(
     let manager: OrgKdeKwinServerDecorationPaletteManager = match globals.bind(&qh, 1..=1, ()) {
         Ok(m) => m,
         Err(_) => {
-            log::info!("kde_palette: protocol not advertised; skipping titlebar colors");
+            tracing::info!("kde_palette: protocol not advertised; skipping titlebar colors");
             return false;
         }
     };
 
     // Wrap mpv's parent surface as a foreign Proxy.
-    let parent_id = match unsafe {
-        ObjectId::from_ptr(WlSurface::interface(), parent_surface.cast())
-    } {
-        Ok(id) => id,
-        Err(_) => {
-            log::warn!("kde_palette: parent surface interface mismatch");
-            return false;
-        }
-    };
+    let parent_id =
+        match unsafe { ObjectId::from_ptr(WlSurface::interface(), parent_surface.cast()) } {
+            Ok(id) => id,
+            Err(_) => {
+                tracing::warn!("kde_palette: parent surface interface mismatch");
+                return false;
+            }
+        };
     let parent = match WlSurface::from_id(&conn, parent_id) {
         Ok(p) => p,
         Err(_) => {
-            log::warn!("kde_palette: parent surface from_id failed");
+            tracing::warn!("kde_palette: parent surface from_id failed");
             return false;
         }
     };
@@ -209,14 +204,14 @@ pub unsafe extern "C" fn jfn_wl_kde_palette_attach(
         None => return false,
     };
 
-    *STATE.lock().unwrap() = Some(PaletteState {
+    *STATE.lock() = Some(PaletteState {
         conn,
         palette,
         colors_dir,
         current_path: None,
     });
 
-    log::info!("KDE decoration palette ready");
+    tracing::info!("KDE decoration palette ready");
     true
 }
 
@@ -225,14 +220,9 @@ pub unsafe extern "C" fn jfn_wl_kde_palette_attach(
 /// pointing at it. `hex` is `Color::hex` — a 7-byte NUL-terminated
 /// `"#RRGGBB"` used only for the filename.
 ///
-/// SAFETY: `hex` must be a valid NUL-terminated UTF-8 pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_wl_kde_palette_set_color(
-    r: u8,
-    g: u8,
-    b: u8,
-    hex: *const c_char,
-) {
+/// # Safety
+/// `hex` must be a valid NUL-terminated UTF-8 pointer.
+pub unsafe fn jfn_wl_kde_palette_set_color(r: u8, g: u8, b: u8, hex: *const c_char) {
     if hex.is_null() {
         return;
     }
@@ -241,7 +231,7 @@ pub unsafe extern "C" fn jfn_wl_kde_palette_set_color(
         _ => return,
     };
 
-    let mut guard = STATE.lock().unwrap();
+    let mut guard = STATE.lock();
     let state = match guard.as_mut() {
         Some(s) => s,
         None => return,
@@ -259,7 +249,7 @@ pub unsafe extern "C" fn jfn_wl_kde_palette_set_color(
     }
 
     if let Err(e) = write_color_scheme(r, g, b, &new_path) {
-        log::warn!("kde_palette: write {} failed: {}", new_path.display(), e);
+        tracing::warn!("kde_palette: write {} failed: {}", new_path.display(), e);
         return;
     }
 
@@ -274,9 +264,8 @@ pub unsafe extern "C" fn jfn_wl_kde_palette_set_color(
     state.current_path = Some(new_path_c);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_wl_kde_palette_post_window_cleanup() {
-    let mut guard = STATE.lock().unwrap();
+pub fn jfn_wl_kde_palette_post_window_cleanup() {
+    let mut guard = STATE.lock();
     let state = match guard.as_mut() {
         Some(s) => s,
         None => return,

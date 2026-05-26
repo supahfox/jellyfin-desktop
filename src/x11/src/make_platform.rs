@@ -1,8 +1,11 @@
 //! X11 backend impl of [`jfn_platform_abi::Platform`].
 
 #![allow(non_snake_case)]
+// Platform trait carries raw-pointer args (dirty rects, accel-paint info)
+// from CEF; trait impls forward them unchanged to unsafe FFI fns.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::{c_int, c_void};
 
 use crate::surface::{
     jfn_x11_alloc_surface, jfn_x11_fade_surface, jfn_x11_free_surface, jfn_x11_restack,
@@ -14,15 +17,9 @@ pub use jfn_platform_abi::{
     DisplayBackend, IdleInhibitLevel, JfnPopupRequest, JfnRect, Platform, SurfaceHandle,
 };
 
-unsafe extern "C" {
-    fn jfn_idle_inhibit_set(level: u32);
-    fn jfn_open_url(url: *const c_char);
-    fn jfn_mpv_handle_get() -> *mut c_void;
-    fn jfn_mpv_set_fullscreen(v: bool);
-    fn jfn_mpv_toggle_fullscreen();
-    fn jfn_playback_fullscreen() -> bool;
-    fn jfn_playback_display_scale() -> f64;
-}
+use jfn_mpv::api::{jfn_mpv_set_fullscreen, jfn_mpv_toggle_fullscreen};
+use jfn_mpv::boot::jfn_mpv_handle_get;
+use jfn_playback::ingest_driver::{jfn_playback_display_scale, jfn_playback_fullscreen};
 
 pub struct X11Platform;
 
@@ -72,149 +69,93 @@ impl Platform for X11Platform {
         }
     }
 
-    fn surface_resize(
-        &self,
-        s: SurfaceHandle,
-        lw: c_int,
-        lh: c_int,
-        pw: c_int,
-        ph: c_int,
-    ) {
+    fn surface_resize(&self, s: SurfaceHandle, lw: c_int, lh: c_int, pw: c_int, ph: c_int) {
         unsafe {
-            jfn_x11_surface_resize(
-                s as *mut crate::x11_state::PlatformSurface,
-                lw,
-                lh,
-                pw,
-                ph,
-            )
+            jfn_x11_surface_resize(s as *mut crate::x11_state::PlatformSurface, lw, lh, pw, ph)
         };
     }
 
     fn surface_set_visible(&self, s: SurfaceHandle, visible: bool) {
         unsafe {
-            jfn_x11_surface_set_visible(
-                s as *mut crate::x11_state::PlatformSurface,
-                visible,
-            )
+            jfn_x11_surface_set_visible(s as *mut crate::x11_state::PlatformSurface, visible)
         };
     }
 
     fn restack(&self, handles: *const SurfaceHandle, n: usize) {
-        unsafe {
-            jfn_x11_restack(
-                handles as *const *mut crate::x11_state::PlatformSurface,
-                n,
-            )
-        };
+        unsafe { jfn_x11_restack(handles as *const *mut crate::x11_state::PlatformSurface, n) };
     }
 
     fn fade_surface(
         &self,
         s: SurfaceHandle,
         fade_sec: f32,
-        on_start: Option<unsafe extern "C" fn(*mut c_void)>,
-        start_ctx: *mut c_void,
-        start_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-        on_done: Option<unsafe extern "C" fn(*mut c_void)>,
-        done_ctx: *mut c_void,
-        done_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+        on_start: Option<Box<dyn FnOnce() + Send>>,
+        on_done: Option<Box<dyn FnOnce() + Send>>,
     ) {
         unsafe {
             jfn_x11_fade_surface(
                 s as *mut crate::x11_state::PlatformSurface,
                 fade_sec,
                 on_start,
-                start_ctx,
-                start_dtor,
                 on_done,
-                done_ctx,
-                done_dtor,
             )
         };
     }
 
-    fn popup_show(&self, _s: SurfaceHandle, req: *const JfnPopupRequest) {
-        if !req.is_null() {
-            let r = unsafe { &*req };
-            if let Some(d) = r.on_selected_dtor {
-                unsafe { d(r.on_selected_ctx) };
-            }
-        }
+    fn popup_show(&self, _s: SurfaceHandle, _req: JfnPopupRequest) {
+        // CEF dispatches selection itself on X11; drop the closure.
     }
 
     fn set_fullscreen(&self, fullscreen: bool) {
-        if unsafe { jfn_mpv_handle_get() }.is_null() {
+        if jfn_mpv_handle_get().is_null() {
             return;
         }
-        if unsafe { jfn_playback_fullscreen() } == fullscreen {
+        if jfn_playback_fullscreen() == fullscreen {
             return;
         }
-        unsafe { jfn_mpv_set_fullscreen(fullscreen) };
+        jfn_mpv_set_fullscreen(fullscreen);
     }
 
     fn toggle_fullscreen(&self) {
-        if !unsafe { jfn_mpv_handle_get() }.is_null() {
-            unsafe { jfn_mpv_toggle_fullscreen() };
+        if !jfn_mpv_handle_get().is_null() {
+            jfn_mpv_toggle_fullscreen();
         }
     }
 
     fn get_scale(&self) -> f32 {
-        let s = unsafe { jfn_playback_display_scale() };
+        let s = jfn_playback_display_scale();
         if s > 0.0 {
             let f = s as f32;
-            if let Ok(mut g) = crate::x11_state::MUT.lock() {
-                if let Some(m) = g.as_mut() {
-                    m.cached_scale = f;
-                }
+            if let Some(m) = crate::x11_state::MUT.lock().as_mut() {
+                m.cached_scale = f;
             }
             return f;
         }
-        if let Ok(g) = crate::x11_state::MUT.lock() {
-            if let Some(m) = g.as_ref() {
-                if m.cached_scale > 0.0 {
-                    return m.cached_scale;
-                }
-            }
+        if let Some(m) = crate::x11_state::MUT.lock().as_ref()
+            && m.cached_scale > 0.0
+        {
+            return m.cached_scale;
         }
         1.0
     }
 
-    fn query_window_position(&self, x: *mut c_int, y: *mut c_int) -> bool {
+    fn query_window_position(&self, x: &mut c_int, y: &mut c_int) -> bool {
         let Some(conn) = crate::x11_state::conn() else {
             return false;
         };
-        let g = crate::x11_state::MUT.lock().unwrap();
+        let g = crate::x11_state::MUT.lock();
         let Some(m) = g.as_ref() else { return false };
-        let Some((px, py, _, _)) =
-            crate::lifecycle::query_parent_geometry(&conn, m.parent, m.root)
+        let Some((px, py, _, _)) = crate::lifecycle::query_parent_geometry(&conn, m.parent, m.root)
         else {
             return false;
         };
-        unsafe {
-            *x = px;
-            *y = py;
-        }
+        *x = px;
+        *y = py;
         true
     }
 
-    fn clamp_window_geometry(
-        &self,
-        w: *mut c_int,
-        h: *mut c_int,
-        _x: *mut c_int,
-        _y: *mut c_int,
-    ) {
-        if w.is_null() || h.is_null() {
-            return;
-        }
-        let mut iw = unsafe { *w };
-        let mut ih = unsafe { *h };
-        crate::lifecycle::clamp_window_geometry(&mut iw, &mut ih);
-        unsafe {
-            *w = iw;
-            *h = ih;
-        }
+    fn clamp_window_geometry(&self, w: &mut c_int, h: &mut c_int, _x: &mut c_int, _y: &mut c_int) {
+        crate::lifecycle::clamp_window_geometry(w, h);
     }
 
     fn set_cursor(&self, t: c_int) {
@@ -222,7 +163,7 @@ impl Platform for X11Platform {
     }
 
     fn set_idle_inhibit(&self, level: IdleInhibitLevel) {
-        unsafe { jfn_idle_inhibit_set(level as u32) };
+        jfn_idle_inhibit_linux::set(level as u32);
     }
 
     fn shared_texture_supported(&self) -> bool {
@@ -233,28 +174,13 @@ impl Platform for X11Platform {
         false
     }
 
-    fn clipboard_read_text_async(
-        &self,
-        on_done: Option<unsafe extern "C" fn(*mut c_void, *const c_char, usize)>,
-        ctx: *mut c_void,
-        dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-    ) {
-        // X11 has no native clipboard read path here — fire empty callback
-        // + dtor inline so any boxed state is released.
-        unsafe {
-            if let Some(cb) = on_done {
-                cb(ctx, c"".as_ptr(), 0);
-            }
-            if let Some(d) = dtor {
-                d(ctx);
-            }
-        }
+    fn clipboard_read_text_async(&self, on_done: Box<dyn FnOnce(&str) + Send>) {
+        // X11 has no native clipboard read path here — fire empty result.
+        on_done("");
     }
 
-    fn open_external_url(&self, utf8: *const c_char, _len: usize) {
-        if !utf8.is_null() {
-            unsafe { jfn_open_url(utf8) };
-        }
+    fn open_external_url(&self, url: &str) {
+        jfn_open_url_linux::open(url);
     }
 }
 

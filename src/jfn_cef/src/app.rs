@@ -2,14 +2,11 @@
 //! handlers — CEF re-execs the same binary for child processes, so the same
 //! App is constructed in every process and CEF dispatches based on the
 //! `--type=` switch.
-//!
-//! Ports `App` and `NativeV8Handler` in `src/cef/cef_app.cpp`.
 
 use cef::*;
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
-use crate::bridge;
 use crate::embedded_js;
 use crate::state;
 use crate::v8_handler::NativeHandlerBuilder;
@@ -61,7 +58,7 @@ wrap_app! {
         ) {
             let Some(cl) = command_line else { return };
 
-            // Disable all Google services. Mirrors cef_app.cpp:300-322.
+            // Disable all Google services.
             for sw in [
                 "disable-background-networking",
                 "disable-client-side-phishing-detection",
@@ -157,7 +154,7 @@ wrap_browser_process_handler! {
 
     impl BrowserProcessHandler {
         fn on_context_initialized(&self) {
-            bridge::log(bridge::LOG_CEF, bridge::LEVEL_INFO, "CEF context initialized");
+            jfn_logging::log(jfn_logging::CATEGORY_CEF, jfn_logging::LEVEL_INFO, "CEF context initialized");
             crate::resource::register();
             // Optional C-side callback (kept for any future C++ context-init
             // hooks; currently unused now that scheme registration is in Rust).
@@ -200,14 +197,13 @@ wrap_render_process_handler! {
             self.inner
                 .profiles
                 .lock()
-                .unwrap()
                 .insert(id, extra.clone());
         }
 
         fn on_browser_destroyed(&self, browser: Option<&mut Browser>) {
             let Some(browser) = browser else { return };
             let id = browser.identifier();
-            self.inner.profiles.lock().unwrap().remove(&id);
+            self.inner.profiles.lock().remove(&id);
         }
 
         fn on_context_created(
@@ -226,7 +222,7 @@ wrap_render_process_handler! {
 
             let profile = {
                 let id = browser.identifier();
-                self.inner.profiles.lock().unwrap().get(&id).cloned()
+                self.inner.profiles.lock().get(&id).cloned()
             };
             let Some(profile) = profile else { return };
 
@@ -315,14 +311,18 @@ enum Arg<'a> {
 }
 
 fn call_js_global_string(frame: &Frame, fn_name: &str, args: &[Arg<'_>]) {
-    let Some(ctx) = frame.v8_context() else { return };
+    let Some(ctx) = frame.v8_context() else {
+        return;
+    };
     if ctx.enter() != 1 {
         return;
     }
     let _drop = ContextExit(&ctx);
     let Some(global) = ctx.global() else { return };
     let fn_key = CefString::from(fn_name);
-    let Some(fn_val) = global.value_bykey(Some(&fn_key)) else { return };
+    let Some(fn_val) = global.value_bykey(Some(&fn_key)) else {
+        return;
+    };
     if fn_val.is_function() != 1 {
         return;
     }
@@ -347,21 +347,31 @@ impl Drop for ContextExit<'_> {
 fn collect_popup_options(frame: &Frame) -> (Vec<String>, i32) {
     let mut options = Vec::new();
     let mut selected = -1;
-    let Some(ctx) = frame.v8_context() else { return (options, selected) };
+    let Some(ctx) = frame.v8_context() else {
+        return (options, selected);
+    };
     if ctx.enter() != 1 {
         return (options, selected);
     }
     let _drop = ContextExit(&ctx);
-    let Some(global) = ctx.global() else { return (options, selected) };
+    let Some(global) = ctx.global() else {
+        return (options, selected);
+    };
     let doc_key = CefString::from("document");
-    let Some(doc) = global.value_bykey(Some(&doc_key)) else { return (options, selected) };
+    let Some(doc) = global.value_bykey(Some(&doc_key)) else {
+        return (options, selected);
+    };
     let active_key = CefString::from("activeElement");
-    let Some(el) = doc.value_bykey(Some(&active_key)) else { return (options, selected) };
+    let Some(el) = doc.value_bykey(Some(&active_key)) else {
+        return (options, selected);
+    };
     if el.is_object() != 1 {
         return (options, selected);
     }
     let tag_key = CefString::from("tagName");
-    let Some(tag) = el.value_bykey(Some(&tag_key)) else { return (options, selected) };
+    let Some(tag) = el.value_bykey(Some(&tag_key)) else {
+        return (options, selected);
+    };
     if tag.is_string() != 1 {
         return (options, selected);
     }
@@ -369,9 +379,13 @@ fn collect_popup_options(frame: &Frame) -> (Vec<String>, i32) {
         return (options, selected);
     }
     let opts_key = CefString::from("options");
-    let Some(opts) = el.value_bykey(Some(&opts_key)) else { return (options, selected) };
+    let Some(opts) = el.value_bykey(Some(&opts_key)) else {
+        return (options, selected);
+    };
     let len_key = CefString::from("length");
-    let Some(len_val) = opts.value_bykey(Some(&len_key)) else { return (options, selected) };
+    let Some(len_val) = opts.value_bykey(Some(&len_key)) else {
+        return (options, selected);
+    };
     if opts.is_object() != 1 || len_val.is_int() != 1 {
         return (options, selected);
     }
@@ -384,33 +398,33 @@ fn collect_popup_options(frame: &Frame) -> (Vec<String>, i32) {
         let mut s = String::new();
         if opt.is_object() == 1 {
             let text_key = CefString::from("text");
-            if let Some(t) = opt.value_bykey(Some(&text_key)) {
-                if t.is_string() == 1 {
-                    s = userfree_to_string(&t.string_value());
-                }
+            if let Some(t) = opt.value_bykey(Some(&text_key))
+                && t.is_string() == 1
+            {
+                s = userfree_to_string(&t.string_value());
             }
         }
         options.push(s);
     }
     let sel_key = CefString::from("selectedIndex");
-    if let Some(sel) = el.value_bykey(Some(&sel_key)) {
-        if sel.is_int() == 1 {
-            selected = sel.int_value();
-        }
+    if let Some(sel) = el.value_bykey(Some(&sel_key))
+        && sel.is_int() == 1
+    {
+        selected = sel.int_value();
     }
     (options, selected)
 }
 
-fn inject_jmp_native(
-    browser: &mut Browser,
-    profile: &DictionaryValue,
-    context: &mut V8Context,
-) {
-    let Some(global) = context.global() else { return };
+fn inject_jmp_native(browser: &mut Browser, profile: &DictionaryValue, context: &mut V8Context) {
+    let Some(global) = context.global() else {
+        return;
+    };
     let functions_key = CefString::from("functions");
     let functions = profile.list(Some(&functions_key));
 
-    let Some(mut jmp_native) = v8_value_create_object(None, None) else { return };
+    let Some(mut jmp_native) = v8_value_create_object(None, None) else {
+        return;
+    };
     let browser_id = browser.identifier();
     if let Some(list) = functions {
         let count = list.size();
@@ -423,16 +437,11 @@ fn inject_jmp_native(
             let cef_name = CefString::from(fn_name_str.as_str());
             let _ = browser_id;
             let mut handler = NativeHandlerBuilder::new(crate::v8_handler::NativeHandler);
-            let Some(mut fn_val) =
-                v8_value_create_function(Some(&cef_name), Some(&mut handler))
+            let Some(mut fn_val) = v8_value_create_function(Some(&cef_name), Some(&mut handler))
             else {
                 continue;
             };
-            jmp_native.set_value_bykey(
-                Some(&cef_name),
-                Some(&mut fn_val),
-                readonly_attr(),
-            );
+            jmp_native.set_value_bykey(Some(&cef_name), Some(&mut fn_val), readonly_attr());
         }
     }
     let key = CefString::from("jmpNative");
@@ -440,7 +449,7 @@ fn inject_jmp_native(
 }
 
 // After each window resize, keep producing compositor frames until
-// `CefLayer::noteStableSize` (C++ side) calls `window.__cefStopRaf`.
+// `CefLayer::noteStableSize` calls `window.__cefStopRaf`.
 const RAF_NUDGE: &str = r#"
 (function () {
     var running = false;
@@ -473,14 +482,16 @@ fn install_raf_nudge(frame: &Frame) {
 
 fn run_user_scripts(profile: &DictionaryValue, frame: &Frame) {
     let scripts_key = CefString::from("scripts");
-    let Some(scripts) = profile.list(Some(&scripts_key)) else { return };
+    let Some(scripts) = profile.list(Some(&scripts_key)) else {
+        return;
+    };
     let n = scripts.size();
     if n == 0 {
         return;
     }
 
     // Renderer is a separate process; load settings here for placeholder
-    // substitution. Mirrors `Settings::instance().load()` in cef_app.cpp:443.
+    // substitution.
     ensure_renderer_settings_loaded();
 
     let mut code = String::new();
@@ -499,11 +510,11 @@ fn run_user_scripts(profile: &DictionaryValue, frame: &Frame) {
             code.replace_range(pos..pos + ph.len(), value);
         }
     }
-    replace_first(&mut code, "__SERVER_URL__", &bridge::settings_server_url());
+    replace_first(&mut code, "__SERVER_URL__", &jfn_config::server_url());
     replace_first(
         &mut code,
         "__SETTINGS_JSON__",
-        &bridge::settings_cli_json(&platform_device_name(), &hwdec_options()),
+        &jfn_config::cli_json(&platform_device_name(), &hwdec_options()),
     );
     replace_first(&mut code, "__APP_VERSION__", crate::APP_VERSION);
     replace_first(
@@ -532,9 +543,9 @@ fn ensure_renderer_settings_loaded() {
     use std::sync::OnceLock;
     static INITED: OnceLock<()> = OnceLock::new();
     INITED.get_or_init(|| {
-        let path = format!("{}/settings.json", bridge::paths_config_dir());
-        bridge::settings_init(&path);
-        let _ = bridge::settings_load();
+        let path = jfn_paths::config_dir().join("settings.json");
+        jfn_config::settings_init(&path);
+        let _ = jfn_config::settings_load();
     });
 }
 

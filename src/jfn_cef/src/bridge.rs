@@ -1,111 +1,152 @@
-#![allow(dead_code)]
-//! Thin Rust wrappers around the C FFI symbols exposed by sibling Rust
-//! crates (jfn-config, jfn-paths, jfn-logging). The dep crates only export
-//! `extern "C"` surfaces today; rather than refactor them to expose `pub`
-//! Rust APIs in this slice, we re-link to the same symbols.
+//! BrowserBridge impl forwarded by jfn_platform_abi.
 //!
-//! TODO: promote each dep crate's internal Rust functions to `pub` and
-//! drop this module.
+//! Lets the `input` and `macos` crates dispatch into whichever CEF layer
+//! is currently active without holding any `*mut JfnCefLayer` themselves
+//! (or depending on jfn-cef, which would cycle through `jfn-input`).
 
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::os::raw::c_int;
 
-// Symbols are pulled in through Cargo workspace deps (jfn-paths, jfn-config,
-// jfn-logging). No #[link] attribute — rustc resolves them through the rlib
-// dep chain when the umbrella `jfn-rust` staticlib is linked.
-unsafe extern "C" {
-    fn jfn_paths_config_dir() -> *mut c_char;
-    fn jfn_paths_cache_dir() -> *mut c_char;
-    fn jfn_paths_free(s: *mut c_char);
+use jfn_platform_abi::BrowserBridge;
 
-    fn jfn_settings_init(path: *const c_char);
-    fn jfn_settings_load() -> bool;
-    fn jfn_settings_get_server_url() -> *mut c_char;
-    fn jfn_settings_cli_json(
-        platform_default: *const c_char,
-        hwdec_opts: *const *const c_char,
-        hwdec_count: usize,
-    ) -> *mut c_char;
-    fn jfn_settings_free_string(s: *mut c_char);
+use crate::browsers::jfn_browsers_active;
+use crate::client::{
+    jfn_cef_layer_can_go_back, jfn_cef_layer_can_go_forward, jfn_cef_layer_copy, jfn_cef_layer_cut,
+    jfn_cef_layer_go_back, jfn_cef_layer_go_forward, jfn_cef_layer_paste, jfn_cef_layer_redo,
+    jfn_cef_layer_select_all, jfn_cef_layer_send_key_event, jfn_cef_layer_send_mouse_click,
+    jfn_cef_layer_send_mouse_move, jfn_cef_layer_send_mouse_wheel, jfn_cef_layer_set_focus,
+    jfn_cef_layer_undo,
+};
 
-    fn jfn_log(category: u8, level: u8, msg: *const c_char, len: usize);
-    fn jfn_log_enabled(category: u8, level: u8) -> bool;
-    fn jfn_log_active_path() -> *mut c_char;
-    fn jfn_log_free_string(s: *mut c_char);
-}
+pub struct CefBrowserBridge;
 
-// Category constants — must match the LogCategory enum in src/logging.h.
-pub const LOG_CEF: u8 = 2;
-pub const LOG_JS: u8 = 5;
-pub const LOG_RESOURCE: u8 = 6;
-
-// Level constants — must match LogLevel in src/logging.h.
-pub const LEVEL_DEBUG: u8 = 1;
-pub const LEVEL_INFO: u8 = 2;
-pub const LEVEL_WARN: u8 = 3;
-pub const LEVEL_ERROR: u8 = 4;
-
-fn take_c_string(s: *mut c_char, free: unsafe extern "C" fn(*mut c_char)) -> String {
-    if s.is_null() {
-        return String::new();
+impl BrowserBridge for CefBrowserBridge {
+    fn send_key_event(
+        &self,
+        type_: c_int,
+        modifiers: u32,
+        windows_key_code: c_int,
+        native_key_code: c_int,
+        is_system_key: bool,
+        character: u16,
+        unmodified_character: u16,
+    ) {
+        let l = jfn_browsers_active();
+        if l.is_null() {
+            return;
+        }
+        unsafe {
+            jfn_cef_layer_send_key_event(
+                l,
+                type_,
+                modifiers,
+                windows_key_code,
+                native_key_code,
+                is_system_key,
+                character,
+                unmodified_character,
+            );
+        }
     }
-    let out = unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned();
-    unsafe { free(s) };
-    out
+
+    fn send_mouse_click(
+        &self,
+        x: c_int,
+        y: c_int,
+        modifiers: u32,
+        button: c_int,
+        mouse_up: bool,
+        click_count: c_int,
+    ) {
+        let l = jfn_browsers_active();
+        if l.is_null() {
+            return;
+        }
+        unsafe {
+            jfn_cef_layer_send_mouse_click(l, x, y, modifiers, button, mouse_up, click_count);
+        }
+    }
+
+    fn send_mouse_move(&self, x: i32, y: i32, modifiers: u32, leave: bool) {
+        let l = jfn_browsers_active();
+        if l.is_null() {
+            return;
+        }
+        unsafe { jfn_cef_layer_send_mouse_move(l, x, y, modifiers, leave) };
+    }
+
+    fn send_mouse_wheel(&self, x: c_int, y: c_int, modifiers: u32, delta_x: c_int, delta_y: c_int) {
+        let l = jfn_browsers_active();
+        if l.is_null() {
+            return;
+        }
+        unsafe { jfn_cef_layer_send_mouse_wheel(l, x, y, modifiers, delta_x, delta_y) };
+    }
+
+    fn set_focus(&self, focus: bool) {
+        let l = jfn_browsers_active();
+        if !l.is_null() {
+            unsafe { jfn_cef_layer_set_focus(l, focus) };
+        }
+    }
+
+    fn navigate_history(&self, forward: bool) {
+        let l = jfn_browsers_active();
+        if l.is_null() {
+            return;
+        }
+        unsafe {
+            if forward {
+                if jfn_cef_layer_can_go_forward(l) {
+                    jfn_cef_layer_go_forward(l);
+                }
+            } else if jfn_cef_layer_can_go_back(l) {
+                jfn_cef_layer_go_back(l);
+            }
+        }
+    }
+
+    fn undo(&self) {
+        let l = jfn_browsers_active();
+        if !l.is_null() {
+            unsafe { jfn_cef_layer_undo(l) };
+        }
+    }
+    fn redo(&self) {
+        let l = jfn_browsers_active();
+        if !l.is_null() {
+            unsafe { jfn_cef_layer_redo(l) };
+        }
+    }
+    fn cut(&self) {
+        let l = jfn_browsers_active();
+        if !l.is_null() {
+            unsafe { jfn_cef_layer_cut(l) };
+        }
+    }
+    fn copy(&self) {
+        let l = jfn_browsers_active();
+        if !l.is_null() {
+            unsafe { jfn_cef_layer_copy(l) };
+        }
+    }
+    fn paste(&self) {
+        let l = jfn_browsers_active();
+        if !l.is_null() {
+            unsafe { jfn_cef_layer_paste(l) };
+        }
+    }
+    fn select_all(&self) {
+        let l = jfn_browsers_active();
+        if !l.is_null() {
+            unsafe { jfn_cef_layer_select_all(l) };
+        }
+    }
+
+    fn has_active(&self) -> bool {
+        !jfn_browsers_active().is_null()
+    }
 }
 
-pub fn paths_config_dir() -> String {
-    take_c_string(unsafe { jfn_paths_config_dir() }, jfn_paths_free)
-}
-
-pub fn paths_cache_dir() -> String {
-    take_c_string(unsafe { jfn_paths_cache_dir() }, jfn_paths_free)
-}
-
-pub fn settings_init(path: &str) {
-    let c = CString::new(path).unwrap();
-    unsafe { jfn_settings_init(c.as_ptr()) };
-}
-
-pub fn settings_load() -> bool {
-    unsafe { jfn_settings_load() }
-}
-
-pub fn settings_server_url() -> String {
-    take_c_string(unsafe { jfn_settings_get_server_url() }, jfn_settings_free_string)
-}
-
-pub fn settings_cli_json(device_name: &str, hwdec_opts: &[&str]) -> String {
-    let device_c = CString::new(device_name).unwrap();
-    let hwdec_cs: Vec<CString> = hwdec_opts
-        .iter()
-        .map(|s| CString::new(*s).unwrap())
-        .collect();
-    let ptrs: Vec<*const c_char> = hwdec_cs.iter().map(|s| s.as_ptr()).collect();
-    let p = unsafe {
-        jfn_settings_cli_json(
-            device_c.as_ptr(),
-            if ptrs.is_empty() {
-                std::ptr::null()
-            } else {
-                ptrs.as_ptr()
-            },
-            ptrs.len(),
-        )
-    };
-    take_c_string(p, jfn_settings_free_string)
-}
-
-pub fn log(category: u8, level: u8, msg: &str) {
-    let c = CString::new(msg).unwrap_or_else(|_| CString::new("<log msg with NUL>").unwrap());
-    let bytes = c.as_bytes();
-    unsafe { jfn_log(category, level, bytes.as_ptr() as *const c_char, bytes.len()) };
-}
-
-pub fn log_enabled(category: u8, level: u8) -> bool {
-    unsafe { jfn_log_enabled(category, level) }
-}
-
-pub fn log_active_path() -> String {
-    take_c_string(unsafe { jfn_log_active_path() }, jfn_log_free_string)
+pub fn install() {
+    jfn_platform_abi::install_browser_bridge(Box::new(CefBrowserBridge));
 }

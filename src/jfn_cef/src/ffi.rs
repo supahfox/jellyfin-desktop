@@ -1,17 +1,15 @@
-//! C ABI surface. Mirrors `namespace CefRuntime` in `src/cef/cef_app.h` so
-//! the C++ shim can be a thin call-through during the transition.
+//! CEF process bootstrap.
 
 use cef::*;
-#[cfg(target_os = "linux")]
-use std::ffi::CStr;
 #[cfg(not(target_os = "windows"))]
 use std::ffi::CString;
-use std::os::raw::{c_char, c_int};
+#[cfg(not(target_os = "windows"))]
+use std::os::raw::c_char;
+use std::os::raw::c_int;
 #[cfg(not(target_os = "windows"))]
 use std::sync::OnceLock;
 
 use crate::app::{JfnApp, JfnAppBuilder};
-use crate::bridge;
 use crate::state;
 
 // jfn constructs Chromium's `MainArgs` itself. Two entry points:
@@ -38,8 +36,7 @@ use crate::state;
 /// Subprocess dispatch + browser-process App construction.
 /// Returns -1 in the browser process (continue startup); returns the
 /// subprocess exit code otherwise.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_cef_start(_argc: c_int, _argv: *const *const c_char) -> c_int {
+pub fn jfn_cef_start() -> c_int {
     // macOS distributes CEF as a framework loaded at runtime via a thunk table
     // in libcef_dll_wrapper (`cef_load_library` populates it). Without this,
     // every CEF call dispatches through a NULL pointer.
@@ -56,21 +53,22 @@ pub extern "C" fn jfn_cef_start(_argc: c_int, _argv: *const *const c_char) -> c_
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     let args = args::Args::new();
     let mut app = JfnAppBuilder::new(JfnApp::new());
-    execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut())
+    execute_process(
+        Some(args.as_main_args()),
+        Some(&mut app),
+        std::ptr::null_mut(),
+    )
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_cef_set_log_severity(severity: c_int) {
+pub fn jfn_cef_set_log_severity(severity: c_int) {
     state::with_config(|c| c.log_severity = severity);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_cef_set_remote_debugging_port(port: c_int) {
+pub fn jfn_cef_set_remote_debugging_port(port: c_int) {
     state::with_config(|c| c.remote_debugging_port = port);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_cef_set_disable_gpu_compositing(disable: bool) {
+pub fn jfn_cef_set_disable_gpu_compositing(disable: bool) {
     if disable {
         state::with_config(|c| {
             c.pending_switches.push(state::PendingSwitch {
@@ -81,27 +79,20 @@ pub extern "C" fn jfn_cef_set_disable_gpu_compositing(disable: bool) {
     }
 }
 
-/// Linux only — Ozone platform selection. `platform_utf8` may be null or
-/// empty (no-op). When set to "wayland", also disables the fractional-scale
-/// protocol so OSR's GetScreenInfo device_scale_factor is honored.
+/// Linux only — Ozone platform selection. Empty string is a no-op.
+/// When set to "wayland", also disables the fractional-scale protocol so
+/// OSR's GetScreenInfo device_scale_factor is honored.
 #[cfg(target_os = "linux")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_cef_set_ozone_platform(platform_utf8: *const c_char) {
-    if platform_utf8.is_null() {
-        return;
-    }
-    let s = unsafe { CStr::from_ptr(platform_utf8) }
-        .to_string_lossy()
-        .into_owned();
-    if s.is_empty() {
+pub fn jfn_cef_set_ozone_platform(platform: &str) {
+    if platform.is_empty() {
         return;
     }
     state::with_config(|c| {
         c.pending_switches.push(state::PendingSwitch {
             name: "ozone-platform".to_string(),
-            value: Some(s.clone()),
+            value: Some(platform.to_string()),
         });
-        if s == "wayland" {
+        if platform == "wayland" {
             c.pending_switches.push(state::PendingSwitch {
                 name: "disable-features".to_string(),
                 value: Some("WaylandFractionalScaleV1".to_string()),
@@ -112,21 +103,19 @@ pub unsafe extern "C" fn jfn_cef_set_ozone_platform(platform_utf8: *const c_char
 
 /// Register the callback invoked from `BrowserProcessHandler::OnContextInitialized`.
 /// MUST be called before `jfn_cef_initialize`.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_cef_set_context_initialized_callback(cb: Option<extern "C" fn()>) {
+pub fn jfn_cef_set_context_initialized_callback(cb: Option<extern "C" fn()>) {
     state::with_config(|c| c.on_context_initialized = cb);
 }
 
 /// Builds CefSettings and calls `CefInitialize`. Returns true on success.
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_cef_initialize() -> bool {
+pub fn jfn_cef_initialize() -> bool {
     let cfg_severity = state::with_config(|c| c.log_severity);
     let cfg_port = state::with_config(|c| c.remote_debugging_port);
 
     // Settings.json singleton must be initialized before the renderer
     // process reads it during OnContextCreated.
-    let settings_path = format!("{}/settings.json", bridge::paths_config_dir());
-    bridge::settings_init(&settings_path);
+    let settings_path = jfn_paths::config_dir().join("settings.json");
+    jfn_config::settings_init(&settings_path);
 
     let mut settings = Settings {
         no_sandbox: 1,
@@ -135,10 +124,11 @@ pub extern "C" fn jfn_cef_initialize() -> bool {
         log_severity: log_severity_from_int(cfg_severity),
         remote_debugging_port: cfg_port,
         locale: CefString::from("en-US"),
-        user_agent: CefString::from(
-            concat!("Mozilla/5.0 jellyfin-desktop/", env!("JFN_APP_VERSION")),
-        ),
-        root_cache_path: CefString::from(bridge::paths_cache_dir().as_str()),
+        user_agent: CefString::from(concat!(
+            "Mozilla/5.0 jellyfin-desktop/",
+            env!("JFN_APP_VERSION")
+        )),
+        root_cache_path: CefString::from(jfn_paths::cache_dir().to_string_lossy().as_ref()),
         ..Settings::default()
     };
     #[cfg(target_os = "macos")]
@@ -208,11 +198,13 @@ fn browser_main_args() -> MainArgs {
             argv: leaked.as_mut_ptr(),
         }
     });
-    MainArgs { argc: c.argc, argv: c.argv }
+    MainArgs {
+        argc: c.argc,
+        argv: c.argv,
+    }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_cef_shutdown() {
+pub fn jfn_cef_shutdown() {
     // Gate further external-pump dispatches before tearing down CEF state.
     #[cfg(target_os = "macos")]
     crate::pump::shutdown();
@@ -261,8 +253,7 @@ fn fill_paths(settings: &mut Settings) {
     let dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     settings.browser_subprocess_path = CefString::from(exe.to_string_lossy().as_ref());
     settings.resources_dir_path = CefString::from(dir.to_string_lossy().as_ref());
-    settings.locales_dir_path =
-        CefString::from(dir.join("locales").to_string_lossy().as_ref());
+    settings.locales_dir_path = CefString::from(dir.join("locales").to_string_lossy().as_ref());
 }
 
 #[cfg(target_os = "linux")]

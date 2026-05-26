@@ -8,24 +8,44 @@
 //! cross-process payload, so we don't hold a long-lived reference.
 
 use cef::{
-    dictionary_value_create, list_value_create, CefString, DictionaryValue, ImplDictionaryValue,
-    ImplListValue,
+    CefString, DictionaryValue, ImplDictionaryValue, ImplListValue, dictionary_value_create,
+    list_value_create,
 };
-use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::sync::OnceLock;
 
 const WEB_FUNCTIONS: &[&str] = &[
-    "playerLoad", "playerStop", "playerPause", "playerPlay", "playerSeek",
-    "playerSetVolume", "playerSetMuted", "playerSetSpeed",
-    "playerSetSubtitle", "playerAddSubtitle", "playerSetAudio", "playerAddAudio",
-    "playerSetAudioDelay", "playerSetSubtitleDelay", "playerSetAspectMode", "playerOsdActive",
-    "openConfigDir", "saveServerUrl",
-    "notifyMetadata", "notifyPosition", "notifySeek",
-    "notifyPlaybackState", "notifyArtwork", "notifyQueueChange",
+    "playerLoad",
+    "playerStop",
+    "playerPause",
+    "playerPlay",
+    "playerSeek",
+    "playerSetVolume",
+    "playerSetMuted",
+    "playerSetSpeed",
+    "playerSetSubtitle",
+    "playerAddSubtitle",
+    "playerSetAudio",
+    "playerAddAudio",
+    "playerSetAudioDelay",
+    "playerSetSubtitleDelay",
+    "playerSetAspectMode",
+    "playerOsdActive",
+    "openConfigDir",
+    "saveServerUrl",
+    "notifyMetadata",
+    "notifyPosition",
+    "notifySeek",
+    "notifyPlaybackState",
+    "notifyArtwork",
+    "notifyQueueChange",
     "notifyRateChange",
-    "appExit", "setSettingValue", "themeColor",
-    "setOsdVisible", "setCursorVisible", "toggleFullscreen",
+    "appExit",
+    "setSettingValue",
+    "themeColor",
+    "setOsdVisible",
+    "setCursorVisible",
+    "toggleFullscreen",
 ];
 
 const WEB_SCRIPTS: &[&str] = &[
@@ -39,24 +59,24 @@ const WEB_SCRIPTS: &[&str] = &[
 
 const OVERLAY_FUNCTIONS: &[&str] = &[
     "getSavedServerUrl",
-    "saveServerUrl", "navigateMain", "dismissOverlay",
-    "checkServerConnectivity", "cancelServerConnectivity",
+    "saveServerUrl",
+    "navigateMain",
+    "dismissOverlay",
+    "checkServerConnectivity",
+    "cancelServerConnectivity",
     "overlayFadeComplete",
 ];
 
-const ABOUT_FUNCTIONS: &[&str] = &[
-    "aboutOpenPath", "aboutDismiss",
-];
+const ABOUT_FUNCTIONS: &[&str] = &["aboutOpenPath", "aboutDismiss"];
 
 static DEVICE_PROFILE_JSON: OnceLock<String> = OnceLock::new();
 
-/// Set the cached Jellyfin device-profile JSON. Called once at startup from
-/// C++ after mpv capabilities are queried. Returns silently if already set.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_cef_set_device_profile_json(
-    json_utf8: *const c_char,
-    len: usize,
-) {
+/// Set the cached Jellyfin device-profile JSON. Called once at startup
+/// after mpv capabilities are queried. Returns silently if already set.
+///
+/// # Safety
+/// `json_utf8` must reference `len` valid UTF-8 bytes, or be null.
+pub unsafe fn jfn_cef_set_device_profile_json(json_utf8: *const c_char, len: usize) {
     if json_utf8.is_null() || len == 0 {
         return;
     }
@@ -103,13 +123,13 @@ pub fn build_for_kind(kind: &str, add_ctx_menu: bool) -> Option<DictionaryValue>
     match kind {
         "web" => {
             let dict = fill_list(WEB_FUNCTIONS, WEB_SCRIPTS, add_ctx_menu)?;
-            if let Some(json) = DEVICE_PROFILE_JSON.get() {
-                if !json.is_empty() {
-                    dict.set_string(
-                        Some(&CefString::from("device_profile_json")),
-                        Some(&CefString::from(json.as_str())),
-                    );
-                }
+            if let Some(json) = DEVICE_PROFILE_JSON.get()
+                && !json.is_empty()
+            {
+                dict.set_string(
+                    Some(&CefString::from("device_profile_json")),
+                    Some(&CefString::from(json.as_str())),
+                );
             }
             Some(dict)
         }
@@ -117,9 +137,4 @@ pub fn build_for_kind(kind: &str, add_ctx_menu: bool) -> Option<DictionaryValue>
         "about" => fill_list(ABOUT_FUNCTIONS, &[], add_ctx_menu),
         _ => None,
     }
-}
-
-#[allow(dead_code)]
-pub(crate) fn _silence_cstr() {
-    let _ = CStr::from_bytes_with_nul(b"\0");
 }

@@ -1,9 +1,8 @@
 //! Test whether the GPU stack can import a GBM-allocated dmabuf as an EGL
 //! image and bind it to a GL texture. Run once during Wayland init to decide
-//! whether CEF's shared-texture path will work; if not, the C++ side falls
-//! back to software CEF rendering.
+//! whether CEF's shared-texture path will work; if not, we fall back to
+//! software CEF rendering.
 //!
-//! Mirrors `probe_shared_texture_support` from the original wayland.cpp.
 //! libEGL, libX11, and libgbm are all dlopened so the binary keeps no link
 //! dependency on them (the X11 case only fires when CEF runs under
 //! `--ozone-platform=x11` over XWayland).
@@ -58,12 +57,10 @@ type FnEglCreateImageKhr = unsafe extern "C" fn(
     *mut c_void,
     *const egl::Int,
 ) -> *mut c_void;
-type FnEglDestroyImageKhr =
-    unsafe extern "C" fn(egl::EGLDisplay, *mut c_void) -> egl::Boolean;
+type FnEglDestroyImageKhr = unsafe extern "C" fn(egl::EGLDisplay, *mut c_void) -> egl::Boolean;
 type FnEglQueryDisplayAttribExt =
     unsafe extern "C" fn(egl::EGLDisplay, egl::Int, *mut isize) -> egl::Boolean;
-type FnEglQueryDeviceStringExt =
-    unsafe extern "C" fn(*mut c_void, egl::Int) -> *const c_char;
+type FnEglQueryDeviceStringExt = unsafe extern "C" fn(*mut c_void, egl::Int) -> *const c_char;
 
 /// Returns true if a GBM-allocated ARGB8888 dmabuf can be imported as an EGL
 /// image and bound to a GL texture on the EGL display CEF will use. The
@@ -76,23 +73,25 @@ type FnEglQueryDeviceStringExt =
 /// stack disagrees.
 ///
 /// `wayland_egl_dpy` may be NULL when `ozone_platform != "wayland"`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn jfn_wl_dmabuf_probe(
+///
+/// # Safety
+/// `ozone_platform` must be NUL-terminated or null. `wayland_egl_dpy`
+/// must be a live `*mut wl_display` when `ozone_platform == "wayland"`.
+pub unsafe fn jfn_wl_dmabuf_probe(
     ozone_platform: *const c_char,
     wayland_egl_dpy: *mut c_void,
 ) -> bool {
     let ozone = if ozone_platform.is_null() {
         ""
     } else {
-        match unsafe { CStr::from_ptr(ozone_platform) }.to_str() {
-            Ok(s) => s,
-            Err(_) => "",
-        }
+        unsafe { CStr::from_ptr(ozone_platform) }
+            .to_str()
+            .unwrap_or_default()
     };
     match probe(ozone, wayland_egl_dpy) {
         Ok(b) => b,
         Err(msg) => {
-            log::warn!("dmabuf probe: {}", msg);
+            tracing::warn!("dmabuf probe: {}", msg);
             false
         }
     }
@@ -101,8 +100,7 @@ pub unsafe extern "C" fn jfn_wl_dmabuf_probe(
 fn probe(ozone: &str, wayland_egl_dpy: *mut c_void) -> Result<bool, String> {
     let egl_lib = unsafe { Library::new("libEGL.so.1") }
         .map_err(|e| format!("libEGL not available: {}", e))?;
-    let egl = egl::Egl::load_from(egl_lib)
-        .map_err(|e| format!("EGL load failed: {}", e))?;
+    let egl = egl::Egl::load_from(egl_lib).map_err(|e| format!("EGL load failed: {}", e))?;
 
     let (display, owns_display, _x11_state) = acquire_display(&egl, ozone, wayland_egl_dpy)?;
 
@@ -112,8 +110,10 @@ fn probe(ozone: &str, wayland_egl_dpy: *mut c_void) -> Result<bool, String> {
         }
 
         let cfg_attrs: [egl::Int; 5] = [
-            egl::RENDERABLE_TYPE, egl::OPENGL_ES2_BIT,
-            egl::SURFACE_TYPE, egl::PBUFFER_BIT,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_ES2_BIT,
+            egl::SURFACE_TYPE,
+            egl::PBUFFER_BIT,
             egl::NONE,
         ];
         let mut config: egl::EGLConfig = ptr::null_mut();
@@ -129,16 +129,14 @@ fn probe(ozone: &str, wayland_egl_dpy: *mut c_void) -> Result<bool, String> {
         }
 
         let ctx_attrs: [egl::Int; 3] = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
-        let ctx = unsafe {
-            (egl.create_context)(display, config, ptr::null_mut(), ctx_attrs.as_ptr())
-        };
+        let ctx =
+            unsafe { (egl.create_context)(display, config, ptr::null_mut(), ctx_attrs.as_ptr()) };
         if ctx.is_null() {
             return Err("can't create GLES context".into());
         }
 
         let pb_attrs: [egl::Int; 5] = [egl::WIDTH, 1, egl::HEIGHT, 1, egl::NONE];
-        let pbuf =
-            unsafe { (egl.create_pbuffer_surface)(display, config, pb_attrs.as_ptr()) };
+        let pbuf = unsafe { (egl.create_pbuffer_surface)(display, config, pb_attrs.as_ptr()) };
         // pbuf may legitimately be null; make_current will then fail.
 
         if unsafe { (egl.make_current)(display, pbuf, pbuf, ctx) } != egl::TRUE {
@@ -151,9 +149,7 @@ fn probe(ozone: &str, wayland_egl_dpy: *mut c_void) -> Result<bool, String> {
 
         let gl_result = run_gl_test(&egl, display);
 
-        unsafe {
-            (egl.make_current)(display, ptr::null_mut(), ptr::null_mut(), ptr::null_mut())
-        };
+        unsafe { (egl.make_current)(display, ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) };
         if !pbuf.is_null() {
             unsafe { (egl.destroy_surface)(display, pbuf) };
         }
@@ -167,9 +163,9 @@ fn probe(ozone: &str, wayland_egl_dpy: *mut c_void) -> Result<bool, String> {
     }
 
     match &result {
-        Ok(true) => log::info!("dmabuf probe: GBM -> EGL -> GL import OK"),
-        Ok(false) => log::warn!("dmabuf probe: ARGB8888 dmabuf import failed"),
-        Err(e) => log::warn!("dmabuf probe: {}", e),
+        Ok(true) => tracing::info!("dmabuf probe: GBM -> EGL -> GL import OK"),
+        Ok(false) => tracing::warn!("dmabuf probe: ARGB8888 dmabuf import failed"),
+        Err(e) => tracing::warn!("dmabuf probe: {}", e),
     }
     result
 }
@@ -194,7 +190,7 @@ fn acquire_display(
     wayland_egl_dpy: *mut c_void,
 ) -> Result<(egl::EGLDisplay, bool, Option<X11Owned>), String> {
     if ozone == "wayland" {
-        log::info!("dmabuf probe: testing on Wayland EGL display");
+        tracing::info!("dmabuf probe: testing on Wayland EGL display");
         return Ok((wayland_egl_dpy as egl::EGLDisplay, false, None));
     }
 
@@ -209,13 +205,17 @@ fn acquire_display(
     if dpy.is_null() {
         return Err("XOpenDisplay failed (no XWayland?)".into());
     }
-    let owned = X11Owned { _lib: lib, dpy, close: close_fn };
+    let owned = X11Owned {
+        _lib: lib,
+        dpy,
+        close: close_fn,
+    };
 
     let display: egl::EGLDisplay = if let Some(fp) = egl.get_proc("eglGetPlatformDisplayEXT") {
         let f: FnEglGetPlatformDisplayExt = unsafe { std::mem::transmute(fp) };
-        unsafe { f(EGL_PLATFORM_X11_KHR, dpy as *mut c_void, ptr::null()) }
+        unsafe { f(EGL_PLATFORM_X11_KHR, dpy, ptr::null()) }
     } else {
-        unsafe { (egl.get_display)(dpy as *mut c_void) }
+        unsafe { (egl.get_display)(dpy) }
     };
     if display.is_null() {
         return Err("no EGL display for X11".into());
@@ -226,7 +226,11 @@ fn acquire_display(
     if unsafe { (egl.initialize)(display, &mut major, &mut minor) } != egl::TRUE {
         return Err("EGL init on X11 failed".into());
     }
-    log::info!("dmabuf probe: testing on X11 EGL display ({}.{})", major, minor);
+    tracing::info!(
+        "dmabuf probe: testing on X11 EGL display ({}.{})",
+        major,
+        minor
+    );
 
     Ok((display, true, Some(owned)))
 }
@@ -243,23 +247,25 @@ fn run_gl_test(egl: &egl::Egl, display: egl::EGLDisplay) -> Result<bool, String>
     let gbm_lib = match unsafe { Library::new("libgbm.so.1") } {
         Ok(l) => l,
         Err(_) => {
-            log::warn!("dmabuf probe: libgbm not available, assuming supported");
+            tracing::warn!("dmabuf probe: libgbm not available, assuming supported");
             return Ok(true);
         }
     };
     let gbm = match GbmFns::load(&gbm_lib) {
         Some(g) => g,
         None => {
-            log::warn!("dmabuf probe: libgbm missing symbols, assuming supported");
+            tracing::warn!("dmabuf probe: libgbm missing symbols, assuming supported");
             return Ok(true);
         }
     };
 
-    let drm_fd = find_drm_node(egl, display).ok_or(()).or_else(|_| open_legacy_node().ok_or(()));
+    let drm_fd = find_drm_node(egl, display)
+        .ok_or(())
+        .or_else(|_| open_legacy_node().ok_or(()));
     let drm_fd = match drm_fd {
         Ok(fd) => fd,
         Err(_) => {
-            log::warn!("dmabuf probe: no DRM render node, assuming supported");
+            tracing::warn!("dmabuf probe: no DRM render node, assuming supported");
             return Ok(true);
         }
     };
@@ -272,7 +278,10 @@ fn run_gl_test(egl: &egl::Egl, display: egl::EGLDisplay) -> Result<bool, String>
 
     let bo = unsafe { (gbm.bo_create)(device, 64, 64, DRM_FORMAT_ARGB8888, GBM_BO_USE_RENDERING) };
     if bo.is_null() {
-        unsafe { (gbm.device_destroy)(device); libc::close(drm_fd); }
+        unsafe {
+            (gbm.device_destroy)(device);
+            libc::close(drm_fd);
+        }
         return Err("gbm_bo_create ARGB8888 failed".into());
     }
 
@@ -283,12 +292,18 @@ fn run_gl_test(egl: &egl::Egl, display: egl::EGLDisplay) -> Result<bool, String>
         Err("gbm_bo_get_fd failed".to_string())
     } else {
         let img_attrs: [egl::Int; 13] = [
-            egl::WIDTH, 64,
-            egl::HEIGHT, 64,
-            EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888 as egl::Int,
-            EGL_DMA_BUF_PLANE0_FD_EXT, dmabuf_fd as egl::Int,
-            EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-            EGL_DMA_BUF_PLANE0_PITCH_EXT, stride as egl::Int,
+            egl::WIDTH,
+            64,
+            egl::HEIGHT,
+            64,
+            EGL_LINUX_DRM_FOURCC_EXT,
+            DRM_FORMAT_ARGB8888 as egl::Int,
+            EGL_DMA_BUF_PLANE0_FD_EXT,
+            dmabuf_fd as egl::Int,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+            0,
+            EGL_DMA_BUF_PLANE0_PITCH_EXT,
+            stride as egl::Int,
             egl::NONE,
         ];
         let image = unsafe {
@@ -301,10 +316,9 @@ fn run_gl_test(egl: &egl::Egl, display: egl::EGLDisplay) -> Result<bool, String>
             )
         };
         if image.is_null() {
-            log::warn!(
-                "dmabuf probe: eglCreateImageKHR failed (0x{:x})",
-                unsafe { (egl.get_error)() }
-            );
+            tracing::warn!("dmabuf probe: eglCreateImageKHR failed (0x{:x})", unsafe {
+                (egl.get_error)()
+            });
             Ok(false)
         } else {
             let mut tex: c_uint = 0;
@@ -315,7 +329,7 @@ fn run_gl_test(egl: &egl::Egl, display: egl::EGLDisplay) -> Result<bool, String>
                 let err = get_err();
                 let ok = err == GL_NO_ERROR;
                 if !ok {
-                    log::warn!(
+                    tracing::warn!(
                         "dmabuf probe: glEGLImageTargetTexture2DOES failed (0x{:x})",
                         err
                     );
@@ -352,7 +366,9 @@ impl GbmFns {
         unsafe {
             Some(Self {
                 create_device: *lib.get::<FnGbmCreateDevice>(b"gbm_create_device\0").ok()?,
-                device_destroy: *lib.get::<FnGbmDeviceDestroy>(b"gbm_device_destroy\0").ok()?,
+                device_destroy: *lib
+                    .get::<FnGbmDeviceDestroy>(b"gbm_device_destroy\0")
+                    .ok()?,
                 bo_create: *lib.get::<FnGbmBoCreate>(b"gbm_bo_create\0").ok()?,
                 bo_destroy: *lib.get::<FnGbmBoDestroy>(b"gbm_bo_destroy\0").ok()?,
                 bo_get_fd: *lib.get::<FnGbmBoGetFd>(b"gbm_bo_get_fd\0").ok()?,
@@ -383,7 +399,7 @@ fn find_drm_node(egl: &egl::Egl, display: egl::EGLDisplay) -> Option<RawFd> {
     let node = unsafe { CStr::from_ptr(node_ptr) };
     let fd = unsafe { libc::open(node.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd >= 0 {
-        log::info!("dmabuf probe using render node: {}", node.to_string_lossy());
+        tracing::info!("dmabuf probe using render node: {}", node.to_string_lossy());
         Some(fd)
     } else {
         None
@@ -394,7 +410,10 @@ fn open_legacy_node() -> Option<RawFd> {
     for i in 128..136 {
         let path = format!("/dev/dri/renderD{}\0", i);
         let fd = unsafe {
-            libc::open(path.as_ptr() as *const c_char, libc::O_RDWR | libc::O_CLOEXEC)
+            libc::open(
+                path.as_ptr() as *const c_char,
+                libc::O_RDWR | libc::O_CLOEXEC,
+            )
         };
         if fd >= 0 {
             return Some(fd);

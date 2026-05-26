@@ -1,5 +1,4 @@
-//! CAMetalLayer-based per-surface compositor — native Rust port of the
-//! C++ originals in `src/platform/macos.mm`.
+//! CAMetalLayer-based per-surface compositor.
 //!
 //! All AppKit operations must run on the main thread; if Browsers calls
 //! alloc/free/restack/resize/set_visible off-main we `dispatch_sync` (or
@@ -13,20 +12,17 @@
 //! returned from `macos_alloc_surface` is `Box::into_raw`; `macos_free_surface`
 //! reconstitutes via `Box::from_raw` after detaching the AppKit subview.
 
+use parking_lot::Mutex;
 use std::ffi::{c_int, c_void};
 use std::ptr;
-use std::sync::Mutex;
 
 use objc2::encode::{Encode, Encoding};
 use objc2::runtime::AnyObject;
 
 use crate::G_IN_TRANSITION;
+use crate::init::{jfn_macos_get_input_view, jfn_macos_get_window};
 
 unsafe extern "C" {
-    /// Accessors implemented in src/platform/macos.mm.
-    fn jfn_macos_get_window() -> *mut AnyObject;
-    fn jfn_macos_get_input_view() -> *mut AnyObject;
-
     static _dispatch_main_q: c_void;
     fn dispatch_async_f(
         queue: *mut c_void,
@@ -37,7 +33,7 @@ unsafe extern "C" {
 
 #[inline]
 fn dispatch_get_main_queue() -> *mut c_void {
-    unsafe { std::ptr::addr_of!(_dispatch_main_q) as *mut c_void }
+    std::ptr::addr_of!(_dispatch_main_q) as *mut c_void
 }
 
 fn is_main_thread() -> bool {
@@ -103,8 +99,7 @@ struct CGSize {
 }
 
 unsafe impl Encode for CGSize {
-    const ENCODING: Encoding =
-        Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+    const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
 }
 
 // =====================================================================
@@ -138,8 +133,7 @@ unsafe impl Encode for MTLClearColor {
 
 // =====================================================================
 // Per-surface state. One per CefLayer (allocated by macos_alloc_surface,
-// destroyed by macos_free_surface). Mirrors the C++ PlatformSurface in
-// src/platform/macos.mm prior to this port.
+// destroyed by macos_free_surface).
 // =====================================================================
 
 struct Surface {
@@ -172,7 +166,9 @@ impl Surface {
     /// at the (possibly new) IOSurface size.
     fn drop_input_texture(&mut self) {
         if !self.input_texture.is_null() {
-            unsafe { let _: () = objc2::msg_send![self.input_texture, release]; }
+            unsafe {
+                let _: () = objc2::msg_send![self.input_texture, release];
+            }
             self.input_texture = ptr::null_mut();
         }
         self.cached_input = ptr::null_mut();
@@ -205,9 +201,9 @@ static G_EXPECTED_SIZE: Mutex<(c_int, c_int)> = Mutex::new((0, 0));
 // =====================================================================
 
 struct MetalState {
-    device: *mut AnyObject,       // id<MTLDevice>, retained
-    queue: *mut AnyObject,        // id<MTLCommandQueue>, retained
-    pipeline: *mut AnyObject,     // id<MTLRenderPipelineState>, retained
+    device: *mut AnyObject,   // id<MTLDevice>, retained
+    queue: *mut AnyObject,    // id<MTLCommandQueue>, retained
+    pipeline: *mut AnyObject, // id<MTLRenderPipelineState>, retained
 }
 unsafe impl Send for MetalState {}
 
@@ -250,8 +246,7 @@ unsafe extern "C" {
 unsafe fn nsstring_from_str(s: &str) -> *mut AnyObject {
     unsafe {
         let bytes = s.as_bytes();
-        let alloc: *mut AnyObject =
-            objc2::msg_send![objc2::class!(NSString), alloc];
+        let alloc: *mut AnyObject = objc2::msg_send![objc2::class!(NSString), alloc];
         let init: *mut AnyObject = objc2::msg_send![
             alloc,
             initWithBytes: bytes.as_ptr() as *const c_void,
@@ -265,20 +260,20 @@ unsafe fn nsstring_from_str(s: &str) -> *mut AnyObject {
 /// Lazy-init Metal device, command queue and the straight→premultiplied
 /// alpha render pipeline. Returns None on driver failure (logged once).
 fn ensure_metal() -> bool {
-    let mut guard = G_METAL.lock().unwrap();
+    let mut guard = G_METAL.lock();
     if guard.is_some() {
         return true;
     }
     unsafe {
         let device = MTLCreateSystemDefaultDevice();
         if device.is_null() {
-            log::error!("[METAL] MTLCreateSystemDefaultDevice failed");
+            tracing::error!("[METAL] MTLCreateSystemDefaultDevice failed");
             return false;
         }
         let queue: *mut AnyObject = objc2::msg_send![device, newCommandQueue];
         if queue.is_null() {
             let _: () = objc2::msg_send![device, release];
-            log::error!("[METAL] newCommandQueue failed");
+            tracing::error!("[METAL] newCommandQueue failed");
             return false;
         }
 
@@ -293,7 +288,7 @@ fn ensure_metal() -> bool {
         ];
         let _: () = objc2::msg_send![src_ns, release];
         if library.is_null() {
-            log::error!("[METAL] newLibraryWithSource failed");
+            tracing::error!("[METAL] newLibraryWithSource failed");
             let _: () = objc2::msg_send![queue, release];
             let _: () = objc2::msg_send![device, release];
             return false;
@@ -315,9 +310,9 @@ fn ensure_metal() -> bool {
         let _: () = objc2::msg_send![pipe_desc, setFragmentFunction: ffn];
 
         let attachments: *mut AnyObject = objc2::msg_send![pipe_desc, colorAttachments];
-        let attach0: *mut AnyObject = objc2::msg_send![attachments, objectAtIndexedSubscript: 0usize];
-        let _: () =
-            objc2::msg_send![attach0, setPixelFormat: MTL_PIXEL_FORMAT_BGRA8_UNORM];
+        let attach0: *mut AnyObject =
+            objc2::msg_send![attachments, objectAtIndexedSubscript: 0usize];
+        let _: () = objc2::msg_send![attach0, setPixelFormat: MTL_PIXEL_FORMAT_BGRA8_UNORM];
         let _: () = objc2::msg_send![attach0, setBlendingEnabled: false];
 
         let mut err2: *mut AnyObject = ptr::null_mut();
@@ -331,7 +326,7 @@ fn ensure_metal() -> bool {
         let _: () = objc2::msg_send![pipe_desc, release];
         let _: () = objc2::msg_send![library, release];
         if pipeline.is_null() {
-            log::error!("[METAL] newRenderPipelineStateWithDescriptor failed");
+            tracing::error!("[METAL] newRenderPipelineStateWithDescriptor failed");
             let _: () = objc2::msg_send![queue, release];
             let _: () = objc2::msg_send![device, release];
             return false;
@@ -410,7 +405,7 @@ unsafe fn create_content_layer(
     scale: f64,
 ) -> (*mut AnyObject, *mut AnyObject) {
     unsafe {
-        let device = G_METAL.lock().unwrap().as_ref().unwrap().device;
+        let device = G_METAL.lock().as_ref().unwrap().device;
 
         // NSView alloc/initWithFrame:
         let view_cls = objc2::class!(NSView);
@@ -444,7 +439,13 @@ unsafe fn create_content_layer(
         let null_obj: *mut AnyObject = objc2::msg_send![null_cls, null];
         let dict_cls = objc2::class!(NSMutableDictionary);
         let dict: *mut AnyObject = objc2::msg_send![dict_cls, dictionaryWithCapacity: 5usize];
-        for key in &["bounds", "position", "contents", "anchorPoint", "contentsRect"] {
+        for key in &[
+            "bounds",
+            "position",
+            "contents",
+            "anchorPoint",
+            "contentsRect",
+        ] {
             let k = nsstring_from_str(key);
             let _: () = objc2::msg_send![dict, setObject: null_obj, forKey: k];
             let _: () = objc2::msg_send![k, release];
@@ -478,7 +479,7 @@ unsafe fn wrap_input_surface(s: &mut Surface, surface: IOSurfaceRef, w: u64, h: 
         return true;
     }
     unsafe {
-        let device = match G_METAL.lock().unwrap().as_ref() {
+        let device = match G_METAL.lock().as_ref() {
             Some(m) => m.device,
             None => return false,
         };
@@ -500,7 +501,7 @@ unsafe fn wrap_input_surface(s: &mut Surface, surface: IOSurfaceRef, w: u64, h: 
             plane: 0usize
         ];
         if tex.is_null() {
-            log::error!("[METAL] wrap input IOSurface failed");
+            tracing::error!("[METAL] wrap input IOSurface failed");
             return false;
         }
         // Replace cached texture (release previous).
@@ -532,21 +533,21 @@ unsafe fn wrap_input_surface(s: &mut Surface, surface: IOSurfaceRef, w: u64, h: 
 
 unsafe fn present_iosurface(s: &mut Surface, info: &cef_dll_sys::_cef_accelerated_paint_info_t) {
     if s.layer.is_null() {
-        log::warn!("[METAL] present skipped: layer null");
+        tracing::warn!("[METAL] present skipped: layer null");
         return;
     }
-    let metal_q = match G_METAL.lock().unwrap().as_ref() {
+    let metal_q = match G_METAL.lock().as_ref() {
         Some(m) => m.queue,
         None => {
-            log::warn!("[METAL] present skipped: metal not initialized");
+            tracing::warn!("[METAL] present skipped: metal not initialized");
             return;
         }
     };
-    let metal_pipe = G_METAL.lock().unwrap().as_ref().unwrap().pipeline;
+    let metal_pipe = G_METAL.lock().as_ref().unwrap().pipeline;
 
     let surface = info.shared_texture_io_surface as IOSurfaceRef;
     if surface.is_null() {
-        log::warn!("[METAL] present skipped: null IOSurface");
+        tracing::warn!("[METAL] present skipped: null IOSurface");
         return;
     }
     let w = unsafe { IOSurfaceGetWidth(surface) } as u64;
@@ -567,12 +568,11 @@ unsafe fn present_iosurface(s: &mut Surface, info: &cef_dll_sys::_cef_accelerate
         }
 
         // @autoreleasepool — bracket the per-frame AppKit allocations.
-        let pool: *mut AnyObject =
-            objc2::msg_send![objc2::class!(NSAutoreleasePool), new];
+        let pool: *mut AnyObject = objc2::msg_send![objc2::class!(NSAutoreleasePool), new];
 
         let drawable: *mut AnyObject = objc2::msg_send![s.layer, nextDrawable];
         if drawable.is_null() {
-            log::warn!("[METAL] nextDrawable returned nil");
+            tracing::warn!("[METAL] nextDrawable returned nil");
             let _: () = objc2::msg_send![pool, drain];
             return;
         }
@@ -615,7 +615,7 @@ unsafe fn present_iosurface(s: &mut Surface, info: &cef_dll_sys::_cef_accelerate
 // =====================================================================
 
 pub(crate) fn drop_input_textures() {
-    let stack = G_SURFACE_STACK.lock().unwrap();
+    let stack = G_SURFACE_STACK.lock();
     for entry in stack.iter() {
         if entry.0.is_null() {
             continue;
@@ -628,13 +628,11 @@ pub(crate) fn drop_input_textures() {
 // Vtable-exposed compositor functions
 // =====================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_set_expected_size(w: c_int, h: c_int) {
-    *G_EXPECTED_SIZE.lock().unwrap() = (w, h);
+pub fn macos_set_expected_size(w: c_int, h: c_int) {
+    *G_EXPECTED_SIZE.lock() = (w, h);
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_alloc_surface() -> *mut c_void {
+pub fn macos_alloc_surface() -> *mut c_void {
     // Allocate the Surface up front; the AppKit setup happens on the
     // main thread but writes into this stable heap address.
     let surf_ptr = Box::into_raw(Box::new(Surface::new()));
@@ -664,8 +662,7 @@ pub extern "C" fn macos_alloc_surface() -> *mut c_void {
     surf_ptr as *mut c_void
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_free_surface(s: *mut c_void) {
+pub fn macos_free_surface(s: *mut c_void) {
     if s.is_null() {
         return;
     }
@@ -675,7 +672,7 @@ pub extern "C" fn macos_free_surface(s: *mut c_void) {
     // we're tearing down. Browsers normally restacks to a smaller order
     // right after this, but the defensive remove matches the C++ path.
     {
-        let mut stack = G_SURFACE_STACK.lock().unwrap();
+        let mut stack = G_SURFACE_STACK.lock();
         stack.retain(|e| e.0 != s_ptr);
     }
 
@@ -696,8 +693,7 @@ pub extern "C" fn macos_free_surface(s: *mut c_void) {
     unsafe { drop(Box::from_raw(s_ptr)) };
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
+pub fn macos_surface_present(s: *mut c_void, raw_info: *const c_void) -> bool {
     if s.is_null() || raw_info.is_null() {
         return false;
     }
@@ -706,7 +702,7 @@ pub extern "C" fn macos_surface_present(s: *mut c_void, raw_info: *const c_void)
 
     // is-cef-main = bottom-of-stack check.
     let is_main = {
-        let stack = G_SURFACE_STACK.lock().unwrap();
+        let stack = G_SURFACE_STACK.lock();
         stack.first().map(|e| e.0) == Some(s_ptr)
     };
 
@@ -716,7 +712,7 @@ pub extern "C" fn macos_surface_present(s: *mut c_void, raw_info: *const c_void)
         }
         unsafe { present_iosurface(&mut *s_ptr, info) };
         // Clear the expected-size gate when the incoming frame matches.
-        let mut exp = G_EXPECTED_SIZE.lock().unwrap();
+        let mut exp = G_EXPECTED_SIZE.lock();
         if exp.0 > 0 {
             let surface = info.shared_texture_io_surface as IOSurfaceRef;
             if !surface.is_null() {
@@ -734,14 +730,7 @@ pub extern "C" fn macos_surface_present(s: *mut c_void, raw_info: *const c_void)
     true
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_surface_resize(
-    s: *mut c_void,
-    lw: c_int,
-    _lh: c_int,
-    pw: c_int,
-    ph: c_int,
-) {
+pub fn macos_surface_resize(s: *mut c_void, lw: c_int, _lh: c_int, pw: c_int, ph: c_int) {
     if s.is_null() {
         return;
     }
@@ -777,8 +766,7 @@ pub extern "C" fn macos_surface_resize(
     });
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_surface_set_visible(s: *mut c_void, visible: bool) {
+pub fn macos_surface_set_visible(s: *mut c_void, visible: bool) {
     if s.is_null() {
         return;
     }
@@ -791,8 +779,7 @@ pub extern "C" fn macos_surface_set_visible(s: *mut c_void, visible: bool) {
     });
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_restack(ordered: *const *mut c_void, n: usize) {
+pub fn macos_restack(ordered: *const *mut c_void, n: usize) {
     // Copy the order into a Vec<usize> we can move into the closure.
     let order: Vec<usize> = if ordered.is_null() || n == 0 {
         Vec::new()
@@ -805,7 +792,7 @@ pub extern "C" fn macos_restack(ordered: *const *mut c_void, n: usize) {
 
     let apply = move || unsafe {
         {
-            let mut stack = G_SURFACE_STACK.lock().unwrap();
+            let mut stack = G_SURFACE_STACK.lock();
             stack.clear();
             stack.extend(order.iter().map(|p| StackEntry(*p as *mut Surface)));
         }
@@ -859,77 +846,40 @@ pub extern "C" fn macos_restack(ordered: *const *mut c_void, n: usize) {
 // opaque.
 // =====================================================================
 
-/// (fn, ctx, dtor) callback triple — `dtor` fires once on drop so the
-/// caller's owned context (e.g. a Box) is freed exactly once across the
-/// start + complete paths.
-struct CallbackTriple {
-    fn_ptr: Option<unsafe extern "C" fn(*mut c_void)>,
-    ctx: *mut c_void,
-    dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-}
-
-unsafe impl Send for CallbackTriple {}
-
-impl CallbackTriple {
-    fn fire(&self) {
-        if let Some(f) = self.fn_ptr {
-            unsafe { f(self.ctx) };
-        }
+fn fire_cb(cb: Option<Box<dyn FnOnce() + Send>>) {
+    if let Some(f) = cb {
+        f();
     }
 }
 
-impl Drop for CallbackTriple {
-    fn drop(&mut self) {
-        if let Some(d) = self.dtor {
-            unsafe { d(self.ctx) };
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn macos_fade_surface(
+pub fn macos_fade_surface(
     s: *mut c_void,
     fade_sec: f32,
-    on_fade_start: Option<unsafe extern "C" fn(*mut c_void)>,
-    start_ctx: *mut c_void,
-    start_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-    on_complete: Option<unsafe extern "C" fn(*mut c_void)>,
-    done_ctx: *mut c_void,
-    done_dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+    on_fade_start: Option<Box<dyn FnOnce() + Send>>,
+    on_complete: Option<Box<dyn FnOnce() + Send>>,
 ) {
-    let start_cb = CallbackTriple {
-        fn_ptr: on_fade_start,
-        ctx: start_ctx,
-        dtor: start_dtor,
-    };
-    let done_cb = CallbackTriple {
-        fn_ptr: on_complete,
-        ctx: done_ctx,
-        dtor: done_dtor,
-    };
-
-    // Null/empty surface: fire both callbacks inline, then drop.
+    // Null/empty surface: fire both closures inline.
     if s.is_null() {
-        start_cb.fire();
-        done_cb.fire();
+        fire_cb(on_fade_start);
+        fire_cb(on_complete);
         return;
     }
     let s_ptr = s as *mut Surface;
     let view = unsafe { (*s_ptr).view };
     let layer = unsafe { (*s_ptr).layer };
     if view.is_null() || layer.is_null() {
-        start_cb.fire();
-        done_cb.fire();
+        fire_cb(on_fade_start);
+        fire_cb(on_complete);
         return;
     }
 
     let s_addr = s_ptr as usize;
     let fade_dur = fade_sec as f64;
     run_on_main_async(move || unsafe {
-        start_cb.fire();
+        fire_cb(on_fade_start);
         let surf = &*(s_addr as *mut Surface);
         if surf.view.is_null() || surf.layer.is_null() {
-            done_cb.fire();
+            fire_cb(on_complete);
             return;
         }
 
@@ -979,20 +929,21 @@ pub extern "C" fn macos_fade_surface(
         // still applies the animation; we just close it out on a timer
         // synchronized with the animation duration.
 
-        let _: () = objc2::msg_send![surf.layer, addAnimation: anim, forKey: ptr::null_mut::<AnyObject>()];
+        let _: () =
+            objc2::msg_send![surf.layer, addAnimation: anim, forKey: ptr::null_mut::<AnyObject>()];
         let _: () = objc2::msg_send![tx_cls, commit];
 
         // dispatch_after_f at fade_sec: hide view + reset opacity + fire done.
         struct FadeDone {
             view: usize,
             layer: usize,
-            done_cb: CallbackTriple,
+            on_complete: Option<Box<dyn FnOnce() + Send>>,
         }
         unsafe impl Send for FadeDone {}
         let payload = Box::new(FadeDone {
             view: surf.view as usize,
             layer: surf.layer as usize,
-            done_cb,
+            on_complete,
         });
         let ctx_ptr = Box::into_raw(payload) as *mut c_void;
         unsafe extern "C" fn after_trampoline(ctx: *mut c_void) {
@@ -1007,16 +958,13 @@ pub extern "C" fn macos_fade_surface(
                     let _: () = objc2::msg_send![layer, removeAllAnimations];
                     let _: () = objc2::msg_send![layer, setOpacity: 1.0f32];
                 }
-                payload.done_cb.fire();
-                // FadeDone drops here; done_cb's dtor fires exactly once.
+                fire_cb(payload.on_complete);
             }
         }
         // dispatch_time(DISPATCH_TIME_NOW, fade_sec * NSEC_PER_SEC).
         let nsec = (fade_dur * 1_000_000_000.0) as i64;
-        let when = unsafe { dispatch_time(0, nsec) };
-        unsafe {
-            dispatch_after_f(when, dispatch_get_main_queue(), ctx_ptr, after_trampoline);
-        }
+        let when = dispatch_time(0, nsec);
+        dispatch_after_f(when, dispatch_get_main_queue(), ctx_ptr, after_trampoline);
     });
 }
 
@@ -1036,11 +984,10 @@ unsafe extern "C" {
 // Metal, clears the stack.
 // =====================================================================
 
-#[unsafe(no_mangle)]
-pub extern "C" fn jfn_macos_compositor_cleanup() {
+pub fn jfn_macos_compositor_cleanup() {
     // Detach lingering subviews + release retained AppKit objects.
     let stragglers: Vec<usize> = {
-        let mut stack = G_SURFACE_STACK.lock().unwrap();
+        let mut stack = G_SURFACE_STACK.lock();
         let out = stack.iter().map(|e| e.0 as usize).collect();
         stack.clear();
         out
@@ -1064,9 +1011,9 @@ pub extern "C" fn jfn_macos_compositor_cleanup() {
         }
     }
 
-    *G_EXPECTED_SIZE.lock().unwrap() = (0, 0);
+    *G_EXPECTED_SIZE.lock() = (0, 0);
 
-    let mut metal = G_METAL.lock().unwrap();
+    let mut metal = G_METAL.lock();
     if let Some(m) = metal.take() {
         unsafe {
             let _: () = objc2::msg_send![m.pipeline, release];
@@ -1075,4 +1022,3 @@ pub extern "C" fn jfn_macos_compositor_cleanup() {
         }
     }
 }
-
