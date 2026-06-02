@@ -2,12 +2,14 @@
 
 #![cfg(target_os = "linux")]
 
+pub(crate) mod gpu_paint_worker;
 pub mod input;
 pub mod input_lifecycle;
 pub mod lifecycle;
 pub mod make_platform;
 pub mod paint_override;
 pub mod shm;
+pub(crate) mod shm_paint_worker;
 pub mod surface;
 pub mod x11_state;
 

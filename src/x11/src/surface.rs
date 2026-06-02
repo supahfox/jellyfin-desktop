@@ -11,14 +11,13 @@
 #![allow(clippy::missing_safety_doc)]
 
 use std::ffi::{c_int, c_void};
-use std::ptr;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
-use jfn_gpu_paint::{DirtyRect, GpuPainter, PixelFrame, WindowTarget};
+use jfn_gpu_paint::{DirtyRect, WindowTarget};
 use xcb::{Xid, x};
 
 use crate::lifecycle::query_parent_geometry;
-use crate::shm::{shm_alloc, shm_free};
 use crate::x11_state::{MUT, Mutable, PlatformSurface, is_none_gc, is_none_window};
 
 pub use jfn_platform_abi::JfnRect;
@@ -137,8 +136,11 @@ pub unsafe fn jfn_x11_free_surface(s: *mut PlatformSurface) {
     }
 
     let surf = unsafe { &mut *s };
-    for buf in &mut surf.bufs {
-        shm_free(buf, Some(&conn));
+    if let Some(worker) = surf.gpu_paint_worker.take() {
+        worker.shutdown();
+    }
+    if let Some(worker) = surf.shm_paint_worker.take() {
+        worker.shutdown();
     }
     if !is_none_window(surf.window) {
         conn.send_request(&x::UnmapWindow {
@@ -163,10 +165,11 @@ pub fn jfn_x11_surface_present(_s: *mut PlatformSurface, _info: *const c_void) -
     false
 }
 
-/// Lazily build the per-surface [`GpuPainter`] and present `buffer`
-/// through it. Returns false on any failure; caller falls back to SHM.
+/// Lazily build the per-surface GPU presenter worker and queue `buffer`
+/// through it. Returns false once the worker has failed so caller falls back
+/// to SHM on subsequent frames.
 #[allow(clippy::too_many_arguments)]
-fn try_gpu_present(
+fn queue_gpu_present(
     surf: &mut PlatformSurface,
     m: &Mutable,
     conn: &xcb::Connection,
@@ -181,7 +184,15 @@ fn try_gpu_present(
     };
     let size = (w as u32, h as u32);
 
-    if surf.painter.is_none() {
+    if surf
+        .gpu_paint_worker
+        .as_ref()
+        .is_some_and(|worker| worker.failed())
+    {
+        return false;
+    }
+
+    if surf.gpu_paint_worker.is_none() {
         let Some(conn_ptr) = NonNull::new(conn.get_raw_conn() as *mut std::ffi::c_void) else {
             return false;
         };
@@ -191,21 +202,19 @@ fn try_gpu_present(
             screen: m.screen_num,
             visual: m.argb_visual,
         };
-        match GpuPainter::new(ctx, target, size) {
-            Ok(p) => surf.painter = Some(p),
-            Err(e) => {
-                eprintln!("[x11] gpu_paint painter init failed: {e}; using SHM");
-                return false;
-            }
-        }
+        surf.gpu_paint_worker = Some(crate::gpu_paint_worker::X11GpuPaintWorker::new(
+            ctx,
+            target,
+            size,
+            surf.visible,
+        ));
     }
-    let painter = surf.painter.as_mut().unwrap();
-    painter.resize(size);
 
-    let stride = (w as u32) * 4;
-    let bgra = unsafe {
-        std::slice::from_raw_parts(buffer as *const u8, (h as usize) * (stride as usize))
+    let stride = (w as u32).saturating_mul(4);
+    let Some(len) = (h as usize).checked_mul(stride as usize) else {
+        return false;
     };
+    let bgra = unsafe { std::slice::from_raw_parts(buffer as *const u8, len) };
     let dirty_rects = unsafe { std::slice::from_raw_parts(dirty, dirty_len) };
     let owned: Vec<DirtyRect> = dirty_rects
         .iter()
@@ -216,20 +225,37 @@ fn try_gpu_present(
             h: r.h,
         })
         .collect();
-    let frame = PixelFrame {
-        width: w as u32,
-        height: h as u32,
-        stride,
-        bgra,
-        dirty: &owned,
-    };
-    match painter.push_pixels(frame) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("[x11] gpu_paint push_pixels failed: {e}; using SHM");
-            false
-        }
+
+    let worker = surf.gpu_paint_worker.as_ref().unwrap();
+    worker.set_visible(surf.visible);
+    worker.resize(size);
+    worker.submit_frame(bgra, w as u32, h as u32, owned)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_shm_present(
+    surf: &mut PlatformSurface,
+    m: &Mutable,
+    conn: Arc<xcb::Connection>,
+    dirty: *const JfnRect,
+    dirty_len: usize,
+    buffer: *const c_void,
+    w: c_int,
+    h: c_int,
+) -> bool {
+    if surf.shm_paint_worker.is_none() {
+        surf.shm_paint_worker = Some(crate::shm_paint_worker::X11ShmPaintWorker::new(
+            conn,
+            surf.window,
+            surf.gc,
+            m.argb_depth,
+            surf.visible,
+        ));
     }
+
+    let worker = surf.shm_paint_worker.as_ref().unwrap();
+    worker.set_visible(surf.visible);
+    worker.submit_frame(buffer, w, h, dirty, dirty_len)
 }
 
 pub unsafe fn jfn_x11_surface_present_software(
@@ -258,70 +284,12 @@ pub unsafe fn jfn_x11_surface_present_software(
 
     // GPU pixel-upload path. Falls through to SHM on any failure so a
     // bad first frame doesn't strand the surface.
-    if m.gpu_caps.gpu_available && try_gpu_present(surf, m, &conn, dirty, dirty_len, buffer, w, h) {
+    if m.gpu_caps.gpu_available && queue_gpu_present(surf, m, &conn, dirty, dirty_len, buffer, w, h)
+    {
         return true;
     }
 
-    let buf = &mut surf.bufs[surf.buf_idx];
-    if !shm_alloc(buf, &conn, w, h) {
-        return false;
-    }
-
-    let stride = (w as usize) * 4;
-    let src = buffer as *const u8;
-    let dirty_slice = unsafe { std::slice::from_raw_parts(dirty, dirty_len) };
-
-    let depth = m.argb_depth;
-    for rect in dirty_slice {
-        let mut rx = rect.x;
-        let mut ry = rect.y;
-        let mut rw = rect.w;
-        let mut rh = rect.h;
-        if rx < 0 {
-            rw += rx;
-            rx = 0;
-        }
-        if ry < 0 {
-            rh += ry;
-            ry = 0;
-        }
-        if rx + rw > w {
-            rw = w - rx;
-        }
-        if ry + rh > h {
-            rh = h - ry;
-        }
-        if rw <= 0 || rh <= 0 {
-            continue;
-        }
-        for row in ry..(ry + rh) {
-            let off = (row as usize) * stride + (rx as usize) * 4;
-            unsafe {
-                ptr::copy_nonoverlapping(src.add(off), buf.data.add(off), (rw as usize) * 4);
-            }
-        }
-        conn.send_request(&xcb::shm::PutImage {
-            drawable: x::Drawable::Window(surf.window),
-            gc: surf.gc,
-            total_width: w as u16,
-            total_height: h as u16,
-            src_x: rx as u16,
-            src_y: ry as u16,
-            src_width: rw as u16,
-            src_height: rh as u16,
-            dst_x: rx as i16,
-            dst_y: ry as i16,
-            depth,
-            format: x::ImageFormat::ZPixmap as u8,
-            send_event: false,
-            offset: 0,
-            shmseg: buf.seg,
-        });
-    }
-
-    surf.buf_idx ^= 1;
-    let _ = conn.flush();
-    true
+    queue_shm_present(surf, m, conn, dirty, dirty_len, buffer, w, h)
 }
 
 pub unsafe fn jfn_x11_surface_resize(
@@ -345,6 +313,12 @@ pub unsafe fn jfn_x11_surface_resize(
     let surf = unsafe { &mut *s };
     surf.pw = pw;
     surf.ph = ph;
+    if pw > 0
+        && ph > 0
+        && let Some(worker) = surf.gpu_paint_worker.as_ref()
+    {
+        worker.resize((pw as u32, ph as u32));
+    }
     if is_none_window(surf.window) {
         return;
     }
@@ -416,6 +390,9 @@ pub unsafe fn jfn_x11_surface_set_visible(s: *mut PlatformSurface, visible: bool
         conn.send_request(&x::UnmapWindow {
             window: surf.window,
         });
+    }
+    if let Some(worker) = surf.gpu_paint_worker.as_ref() {
+        worker.set_visible(visible);
     }
     let _ = conn.flush();
 }

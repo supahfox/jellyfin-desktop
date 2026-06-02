@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use xcb::{Xid, XidNew, x};
 
-use crate::shm::shm_free;
 use crate::x11_state::{Atoms, CONN, MUT, Mutable, is_none_gc, is_none_window};
 
 use jfn_mpv::api::jfn_mpv_get_property_int;
@@ -261,8 +260,11 @@ pub fn cleanup() {
                     continue;
                 }
                 let s = unsafe { &mut *s_ptr };
-                for buf in &mut s.bufs {
-                    shm_free(buf, Some(&conn));
+                if let Some(worker) = s.gpu_paint_worker.take() {
+                    worker.shutdown();
+                }
+                if let Some(worker) = s.shm_paint_worker.take() {
+                    worker.shutdown();
                 }
                 if !is_none_gc(s.gc) {
                     conn.send_request(&x::FreeGc { gc: s.gc });
