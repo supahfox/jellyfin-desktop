@@ -5,6 +5,7 @@ use std::ffi::{CStr, CString, c_char, c_int};
 use std::ptr;
 use std::sync::OnceLock;
 
+use clap::Parser;
 use jfn_cef::{APP_CEF_VERSION, APP_VERSION_FULL};
 use jfn_platform_abi::{DisplayBackend, IdleInhibitLevel, Platform, WindowGeometry};
 
@@ -27,34 +28,12 @@ fn video_bg_get() -> u32 {
     VIDEO_BG.load(std::sync::atomic::Ordering::Acquire)
 }
 
-const DEFAULT_LOG_FILTER: &str = "info";
+pub(crate) const DEFAULT_LOG_FILTER: &str = "info";
 
 struct BootArgs {
     ozone_platform: String,
     disable_gpu_compositing: bool,
     remote_debugging_port: c_int,
-}
-
-/// Collect the C `argc`/`argv` into owned Rust strings. Null entries become
-/// empty strings; non-UTF-8 bytes are replaced lossily.
-///
-/// # Safety
-/// `argv` must point to `argc` valid NUL-terminated C strings (or null
-/// entries).
-unsafe fn argv_to_vec(argc: c_int, argv: *const *const c_char) -> Vec<String> {
-    if argv.is_null() || argc <= 0 {
-        return Vec::new();
-    }
-    let mut args = Vec::with_capacity(argc as usize);
-    for i in 0..argc as isize {
-        let p = unsafe { *argv.offset(i) };
-        if p.is_null() {
-            args.push(String::new());
-        } else {
-            args.push(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
-        }
-    }
-    args
 }
 
 fn cs(s: &str) -> CString {
@@ -73,34 +52,6 @@ fn normalize_passthrough(s: &str) -> String {
         .join(",")
 }
 
-fn print_help() {
-    let hwdec_default = jfn_mpv::HWDEC_DEFAULT;
-    println!("Usage: jellyfin-desktop [options]\n");
-    println!("Options:");
-    println!("  -h, --help                Show this help");
-    println!("  -v, --version             Show version");
-    println!(
-        "  --log-level <filter>      e.g. info | debug | debug,mpv=trace,CEF=off (default: {DEFAULT_LOG_FILTER})"
-    );
-    println!("  --log-file <path>         Write logs to file ('' to disable)");
-    println!("  --hwdec <mode>            Hardware decoding mode (default: {hwdec_default})");
-    println!("  --audio-passthrough <codecs>  e.g. ac3,dts-hd,eac3,truehd");
-    println!("  --audio-exclusive         Exclusive audio output");
-    println!("  --audio-channels <layout> e.g. stereo, 5.1, 7.1");
-    println!("  --remote-debug-port <port> Chrome remote debugging");
-    println!("  --disable-gpu-compositing Disable CEF GPU compositing");
-    println!("  --ozone-platform <plat>   CEF ozone platform (default: follows --platform)");
-    if cfg!(target_os = "linux") {
-        println!("  --platform <wayland|x11>  Force display backend (Linux only)");
-        println!(
-            "  --x11-paint <gpu|shm>     Force X11 paint path; skips Vulkan probe (Linux only)"
-        );
-        println!(
-            "  --wayland-paint <dmabuf|gpu|shm>  Force Wayland paint path; skips dmabuf probe (Linux only)"
-        );
-    }
-}
-
 fn print_version() {
     println!(
         "jellyfin-desktop {}\n\nCEF {}\n",
@@ -112,10 +63,7 @@ fn print_version() {
 }
 
 /// Subprocess dispatch + early-boot (settings/CLI/logging).
-///
-/// # Safety
-/// `argv` must point to `argc` valid NUL-terminated C strings.
-pub unsafe fn jfn_app_main(argc: c_int, argv: *const *const c_char) -> c_int {
+pub fn jfn_app_main() -> c_int {
     // Windows/macOS use a fixed display backend so the Platform must be
     // installed before CefExecuteProcess (subprocesses bail out of the
     // browser-process flow but may still query the platform).
@@ -139,12 +87,26 @@ pub unsafe fn jfn_app_main(argc: c_int, argv: *const *const c_char) -> c_int {
         return rc;
     }
 
-    // 2. Settings init + load.
+    // Path overrides must be applied before settings load and CEF
+    // root_cache_path construction below.
+    let cli = cli::Cli::parse();
+    if cli.version {
+        print_version();
+        return 0;
+    }
+    if let Some(path) = &cli.config_dir {
+        jfn_paths::set_config_dir_override(path.into());
+    }
+    if let Some(path) = &cli.cache_dir {
+        jfn_paths::set_cache_dir_override(path.into());
+    }
+
+    // 3. Settings init + load.
     let settings_path = jfn_paths::config_dir().join("settings.json");
     jfn_config::settings_init(&settings_path);
     jfn_config::settings_load();
 
-    // 3. Seed CLI defaults from saved settings.
+    // 4. Seed CLI defaults from saved settings.
     let saved_hwdec = jfn_config::hwdec();
     let saved_pass = jfn_config::audio_passthrough();
     let saved_chans = jfn_config::audio_channels();
@@ -163,74 +125,34 @@ pub unsafe fn jfn_app_main(argc: c_int, argv: *const *const c_char) -> c_int {
     let mut audio_channels = saved_chans;
     let mut log_level = saved_log_level;
 
-    // 4. Parse argv.
-    let have_x11 = cfg!(target_os = "linux");
-    let args = unsafe { argv_to_vec(argc, argv) };
-
     let mut ozone_platform = String::new();
-    #[cfg(target_os = "linux")]
-    let mut platform_override = String::new();
-    #[cfg(target_os = "linux")]
-    let mut x11_paint: Option<cli::X11Paint> = None;
-    #[cfg(target_os = "linux")]
-    let mut wayland_paint: Option<cli::WaylandPaint> = None;
-    // Assigned exactly once in the Continue arm; the other arms diverge.
-    let log_file: Option<String>;
+    let log_file = cli.log_file;
     let mut disable_gpu_compositing = false;
     let mut remote_debugging_port: c_int = 0;
 
-    match cli::parse(args, have_x11) {
-        cli::CliOutcome::Help => {
-            print_help();
-            return 0;
-        }
-        cli::CliOutcome::Version => {
-            print_version();
-            return 0;
-        }
-        cli::CliOutcome::Error(arg) => {
-            eprintln!("Error: unknown argument '{arg}'");
-            return 1;
-        }
-        cli::CliOutcome::Continue(a) => {
-            if let Some(v) = a.hwdec {
-                hwdec = v;
-            }
-            if let Some(v) = a.audio_passthrough {
-                audio_passthrough = v;
-            }
-            if let Some(v) = a.audio_channels {
-                audio_channels = v;
-            }
-            if let Some(v) = a.log_level {
-                log_level = v;
-            }
-            log_file = a.log_file;
-            if let Some(v) = a.ozone_platform {
-                ozone_platform = v;
-            }
-            #[cfg(target_os = "linux")]
-            if let Some(v) = a.platform_override {
-                platform_override = v;
-            }
-            #[cfg(target_os = "linux")]
-            if let Some(v) = a.x11_paint {
-                x11_paint = Some(v);
-            }
-            #[cfg(target_os = "linux")]
-            if let Some(v) = a.wayland_paint {
-                wayland_paint = Some(v);
-            }
-            if a.audio_exclusive {
-                audio_exclusive = true;
-            }
-            if a.disable_gpu_compositing {
-                disable_gpu_compositing = true;
-            }
-            if let Some(p) = a.remote_debugging_port {
-                remote_debugging_port = p;
-            }
-        }
+    if let Some(v) = cli.hwdec {
+        hwdec = v;
+    }
+    if let Some(v) = cli.audio_passthrough {
+        audio_passthrough = v;
+    }
+    if let Some(v) = cli.audio_channels {
+        audio_channels = v;
+    }
+    if let Some(v) = cli.log_level {
+        log_level = v;
+    }
+    if let Some(v) = cli.ozone_platform {
+        ozone_platform = v;
+    }
+    if cli.audio_exclusive {
+        audio_exclusive = true;
+    }
+    if cli.disable_gpu_compositing {
+        disable_gpu_compositing = true;
+    }
+    if let Some(p) = cli.remote_debug_port {
+        remote_debugging_port = p;
     }
 
     // 5. Validate hwdec.
@@ -274,48 +196,33 @@ pub unsafe fn jfn_app_main(argc: c_int, argv: *const *const c_char) -> c_int {
     //    returned (we ran before CefExecuteProcess on those platforms).
     #[cfg(target_os = "linux")]
     {
-        let backend = if platform_override == "wayland" {
-            DisplayBackend::Wayland
-        } else if platform_override == "x11" {
-            DisplayBackend::X11
-        } else if !platform_override.is_empty() {
-            eprintln!(
-                "Unknown platform: {} (expected wayland or x11)",
-                platform_override
-            );
-            return 1;
-        } else {
-            let has_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-            let has_display = std::env::var_os("DISPLAY").is_some();
-            if has_wayland || !has_display {
-                DisplayBackend::Wayland
-            } else {
-                DisplayBackend::X11
+        let backend = match cli.platform {
+            Some(cli::PlatformArg::Wayland) => DisplayBackend::Wayland,
+            Some(cli::PlatformArg::X11) => DisplayBackend::X11,
+            None => {
+                let has_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+                let has_display = std::env::var_os("DISPLAY").is_some();
+                if has_wayland || !has_display {
+                    DisplayBackend::Wayland
+                } else {
+                    DisplayBackend::X11
+                }
             }
         };
-        if matches!(backend, DisplayBackend::Wayland) && x11_paint.is_some() {
-            eprintln!("Error: --x11-paint set but display backend is wayland");
-            return 1;
-        }
-        if matches!(backend, DisplayBackend::X11) && wayland_paint.is_some() {
-            eprintln!("Error: --wayland-paint set but display backend is x11");
-            return 1;
-        }
-
-        if let Some(mode) = x11_paint {
-            let mapped = match mode {
-                cli::X11Paint::Gpu => jfn_x11::X11PaintOverride::Gpu,
-                cli::X11Paint::Shm => jfn_x11::X11PaintOverride::Shm,
-            };
-            jfn_x11::set_paint_override(mapped);
-        }
-        if let Some(mode) = wayland_paint {
-            let mapped = match mode {
-                cli::WaylandPaint::Dmabuf => jfn_wayland::WlPaintOverride::Dmabuf,
-                cli::WaylandPaint::Gpu => jfn_wayland::WlPaintOverride::Gpu,
-                cli::WaylandPaint::Shm => jfn_wayland::WlPaintOverride::Shm,
-            };
-            jfn_wayland::set_paint_override(mapped);
+        if let Some(p) = cli.platform_paint {
+            match backend {
+                DisplayBackend::Wayland => jfn_wayland::set_paint_override(match p {
+                    cli::Paint::Dmabuf => jfn_wayland::WlPaintOverride::Dmabuf,
+                    cli::Paint::Gpu => jfn_wayland::WlPaintOverride::Gpu,
+                    cli::Paint::Shm => jfn_wayland::WlPaintOverride::Shm,
+                }),
+                DisplayBackend::X11 => jfn_x11::set_paint_override(match p {
+                    cli::Paint::Dmabuf => jfn_x11::X11PaintOverride::Dmabuf,
+                    cli::Paint::Gpu => jfn_x11::X11PaintOverride::Gpu,
+                    cli::Paint::Shm => jfn_x11::X11PaintOverride::Shm,
+                }),
+                _ => {}
+            }
         }
 
         let p: Box<dyn Platform> = match backend {
@@ -332,9 +239,7 @@ pub unsafe fn jfn_app_main(argc: c_int, argv: *const *const c_char) -> c_int {
     // 10. Install signal handler (Unix) / Windows ConsoleCtrl handler.
     install_signal_handler();
 
-    // 11. Single-instance check (Linux + Windows; macOS uses NSApp delegate
-    //     activation).
-    #[cfg(not(target_os = "macos"))]
+    // 11. Single-instance check.
     {
         if crate::single_instance::try_signal_existing() {
             tracing::info!(target: "Main", "Signaled existing instance, exiting");
@@ -492,23 +397,21 @@ pub unsafe fn jfn_app_main(argc: c_int, argv: *const *const c_char) -> c_int {
         // folds property changes into the ingest layer; if any drain step
         // observes a fatal event we bail out of jfn_app_main.
         loop {
-            let ev = jfn_mpv::api::jfn_mpv_wait_event(0.0);
-            if ev.is_null() {
-                break;
+            match jfn_mpv::api::wait_event_owned(0.0) {
+                jfn_mpv::api::WaitEvent::None => {
+                    break;
+                }
+                jfn_mpv::api::WaitEvent::LogMessage(m) => {
+                    jfn_mpv::forward_log_to_tracing(&m);
+                    continue;
+                }
+                jfn_mpv::api::WaitEvent::Event(
+                    jfn_mpv::Event::Shutdown | jfn_mpv::Event::EndFile(_),
+                ) => return 0,
+                jfn_mpv::api::WaitEvent::Event(event) => {
+                    consume_vo_event(&event, &mut mw, &mut mh, &mut need_max);
+                }
             }
-            let event_id = unsafe { (*ev).event_id }.0;
-            if event_id == 0 {
-                // MPV_EVENT_NONE — queue empty.
-                break;
-            }
-            if event_id == 2 {
-                log_mpv_event(ev);
-                continue;
-            }
-            if event_id == 1 || event_id == 7 {
-                return 0;
-            }
-            consume_vo_event(ev, &mut mw, &mut mh, &mut need_max);
         }
         if vo_ready(&mut mw, &mut mh, &need_max, wait_for_scale) {
             break 'wait;
@@ -520,15 +423,14 @@ pub unsafe fn jfn_app_main(argc: c_int, argv: *const *const c_char) -> c_int {
         jfn_macos::macos_pump_block(60.0);
         #[cfg(not(target_os = "macos"))]
         {
-            let ev = jfn_mpv::api::jfn_mpv_wait_event(-1.0);
-            if !ev.is_null() {
-                let event_id = unsafe { (*ev).event_id }.0;
-                if event_id == 2 {
-                    log_mpv_event(ev);
-                } else if event_id == 1 || event_id == 7 {
-                    return 0;
-                } else if event_id != 0 {
-                    consume_vo_event(ev, &mut mw, &mut mh, &mut need_max);
+            match jfn_mpv::api::wait_event_owned(-1.0) {
+                jfn_mpv::api::WaitEvent::None => {}
+                jfn_mpv::api::WaitEvent::LogMessage(m) => jfn_mpv::forward_log_to_tracing(&m),
+                jfn_mpv::api::WaitEvent::Event(
+                    jfn_mpv::Event::Shutdown | jfn_mpv::Event::EndFile(_),
+                ) => return 0,
+                jfn_mpv::api::WaitEvent::Event(event) => {
+                    consume_vo_event(&event, &mut mw, &mut mh, &mut need_max);
                 }
             }
         }
@@ -631,23 +533,17 @@ fn install_signal_handler() {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
 static LISTENER_GUARD: OnceLock<ListenerGuardSlot> = OnceLock::new();
 
-#[cfg(not(target_os = "macos"))]
 struct ListenerGuardSlot;
-#[cfg(not(target_os = "macos"))]
 impl Drop for ListenerGuardSlot {
     fn drop(&mut self) {
         crate::single_instance::stop_listener();
     }
 }
-#[cfg(not(target_os = "macos"))]
 unsafe impl Send for ListenerGuardSlot {}
-#[cfg(not(target_os = "macos"))]
 unsafe impl Sync for ListenerGuardSlot {}
 
-#[cfg(not(target_os = "macos"))]
 fn install_listener_guard() {
     let _ = LISTENER_GUARD.set(ListenerGuardSlot);
 }
@@ -761,67 +657,38 @@ fn mpv_log_level_from_filter() -> &'static str {
     }
 }
 
-fn log_mpv_event(ev: *mut jfn_mpv::sys::mpv_event) {
-    let msg = unsafe { (*ev).data as *mut jfn_mpv::sys::mpv_event_log_message };
-    if msg.is_null() {
-        return;
+const JFN_OBSERVE_WINDOW_MAX: u64 = 11;
+
+fn current_macos_logical_size() -> Option<(i32, i32)> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut w: c_int = 0;
+        let mut h: c_int = 0;
+        if jfn_macos::jfn_macos_query_logical_content_size(&mut w, &mut h) {
+            Some((w, h))
+        } else {
+            None
+        }
     }
-    let prefix = unsafe { CStr::from_ptr((*msg).prefix) }.to_string_lossy();
-    let text = unsafe { CStr::from_ptr((*msg).text) }.to_string_lossy();
-    let level = unsafe { (*msg).log_level }.0 as i32;
-    // mpv log levels: FATAL=10, ERROR=20, WARN=30, INFO=40, V=50,
-    // DEBUG=60, TRACE=70.
-    match level {
-        10 | 20 => tracing::error!(target: "mpv", "{prefix}: {text}"),
-        30 => tracing::warn!(target: "mpv", "{prefix}: {text}"),
-        40 => tracing::info!(target: "mpv", "{prefix}: {text}"),
-        50 => tracing::debug!(target: "mpv", "{prefix}: {text}"),
-        60 => tracing::trace!(target: "mpv", "{prefix}: {text}"),
-        _ => tracing::warn!(target: "mpv", "[unhandled mpv level {level}] {prefix}: {text}"),
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }
 
-const JFN_OBSERVE_WINDOW_MAX: u64 = 11;
-
-fn consume_vo_event(
-    ev: *mut jfn_mpv::sys::mpv_event,
-    mw: &mut i32,
-    mh: &mut i32,
-    need_max: &mut bool,
-) {
-    let event_id = unsafe { (*ev).event_id }.0;
-    if event_id == 22 {
-        // MPV_EVENT_PROPERTY_CHANGE
-        let scale_raw = plat().get_scale();
-        let scale = if scale_raw > 0.0 { scale_raw } else { 1.0 };
-        let has_macos_logical;
-        let mut mac_lw: c_int = 0;
-        let mut mac_lh: c_int = 0;
-        #[cfg(target_os = "macos")]
-        {
-            has_macos_logical =
-                jfn_macos::jfn_macos_query_logical_content_size(&mut mac_lw, &mut mac_lh);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            has_macos_logical = false;
-            let _ = (&mut mac_lw, &mut mac_lh);
-        }
-        unsafe {
-            jfn_playback::ingest_driver::jfn_playback_ingest_mpv_event(
-                ev as *const _,
-                scale,
-                has_macos_logical,
-                mac_lw,
-                mac_lh,
-            );
-        }
-        let reply = unsafe { (*ev).reply_userdata };
-        if reply == JFN_OBSERVE_WINDOW_MAX
-            && jfn_playback::ingest_driver::jfn_playback_window_maximized()
-        {
-            *need_max = false;
-        }
+fn consume_vo_event(event: &jfn_mpv::Event, mw: &mut i32, mh: &mut i32, need_max: &mut bool) {
+    let scale_raw = plat().get_scale();
+    let scale = if scale_raw > 0.0 { scale_raw } else { 1.0 };
+    jfn_playback::ingest_driver::jfn_playback_ingest_mpv_event_owned(
+        event,
+        scale,
+        current_macos_logical_size(),
+    );
+    if let jfn_mpv::Event::PropertyChange { id, .. } = event
+        && *id == JFN_OBSERVE_WINDOW_MAX
+        && jfn_playback::ingest_driver::jfn_playback_window_maximized()
+    {
+        *need_max = false;
     }
     let pw = jfn_playback::ingest_driver::jfn_playback_osd_pw();
     let ph = jfn_playback::ingest_driver::jfn_playback_osd_ph();

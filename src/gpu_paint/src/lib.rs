@@ -4,15 +4,11 @@
 //! Wayland backend's EGL-probe-failed branch (previously fell to
 //! `wl_shm` CPU upload). This crate owns a single shared [`GpuContext`]
 //! and one [`GpuPainter`] per CEF surface.
-//!
-//! v0 ships the pixel-upload path (CEF `OnPaint` BGRA → Vulkan staging
-//! → swapchain). The dmabuf-import path (CEF `OnAcceleratedPaint` → VK
-//! external memory) is staged for v1; the API already accepts
-//! [`DmabufFrame`] so call sites do not have to change shape.
 
 #![cfg(target_os = "linux")]
 
 mod context;
+mod dmabuf_import;
 mod error;
 mod painter;
 mod types;
@@ -20,4 +16,4 @@ mod types;
 pub use context::{Capabilities, GpuContext};
 pub use error::GpuPaintError;
 pub use painter::GpuPainter;
-pub use types::{DirtyRect, DmabufFrame, DmabufPlane, PixelFrame, WindowTarget};
+pub use types::{DirtyRect, DmabufFormat, DmabufFrame, DmabufPlane, PixelFrame, WindowTarget};

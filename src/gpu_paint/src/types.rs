@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use std::os::fd::RawFd;
+use std::os::fd::OwnedFd;
 use std::ptr::NonNull;
 
 /// Where the painter should attach its swapchain. Caller passes raw
@@ -36,24 +36,31 @@ pub struct DirtyRect {
     pub h: i32,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DmabufFormat {
+    Bgra8,
+    Rgba8,
+}
+
+/// One plane of a dmabuf. Owns its fd, closed on drop; Vulkan consumes a
+/// dup of it at import.
 pub struct DmabufPlane {
-    pub fd: RawFd,
-    pub offset: u32,
+    pub fd: OwnedFd,
+    pub offset: u64,
     pub stride: u32,
 }
 
-/// Reserved for the v1 dmabuf-import path. v0 only routes
-/// [`PixelFrame`]; call sites already pass `DmabufFrame` so the wiring
-/// does not change shape when v1 lands.
-pub struct DmabufFrame<'a> {
+/// A CEF `OnAcceleratedPaint` frame. CEF reclaims the original fd when the
+/// paint callback returns, so the caller must dup into the `OwnedFd`.
+pub struct DmabufFrame {
     pub width: u32,
     pub height: u32,
-    pub fourcc: u32,
+    /// CEF's visible rect; the coded `width`/`height` may be padded larger.
+    pub visible_w: u32,
+    pub visible_h: u32,
+    pub format: DmabufFormat,
     pub modifier: u64,
-    pub planes: &'a [DmabufPlane],
-    pub buffer_id: u64,
-    pub dirty: &'a [DirtyRect],
+    pub planes: Vec<DmabufPlane>,
 }
 
 pub struct PixelFrame<'a> {

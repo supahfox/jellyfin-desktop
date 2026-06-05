@@ -6,10 +6,10 @@
 //! suppresses fields that are at their default (empty strings, sentinel
 //! values, zero geometry) so existing config files round-trip unchanged.
 
+use jfn_platform_abi::WindowDecorations;
 use parking_lot::{Condvar, Mutex};
 use serde_json::{Map, Value, json};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::thread::{self, JoinHandle};
@@ -57,22 +57,8 @@ struct SettingsData {
     disable_gpu_compositing: bool,
     transparent_titlebar: bool,
     force_transcoding: bool,
-    // None = auto (detected from the desktop environment); Some = explicit.
-    // Values: "csd" (in-app), "server" (server-side), "serverThemed"
-    // (server-side, tinted via the KDE palette protocol).
-    window_decorations: Option<String>,
+    window_decorations: Option<WindowDecorations>,
     hide_scrollbar: bool,
-}
-
-/// Auto default for window decorations. KDE draws its own server-side
-/// decorations (and we can tint them), so default to themed server-side there;
-/// elsewhere (notably GNOME, which never draws decorations) default to in-app
-/// client-side. Detected from `XDG_CURRENT_DESKTOP`.
-fn default_window_decorations() -> String {
-    let kde = std::env::var("XDG_CURRENT_DESKTOP")
-        .map(|v| v.split(':').any(|s| s.eq_ignore_ascii_case("KDE")))
-        .unwrap_or(false);
-    if kde { "serverThemed" } else { "csd" }.to_string()
 }
 
 impl Default for SettingsData {
@@ -158,8 +144,12 @@ impl SettingsData {
         if let Some(b) = v.get("forceTranscoding").and_then(Value::as_bool) {
             self.force_transcoding = b;
         }
-        if let Some(s) = v.get("windowDecorations").and_then(Value::as_str) {
-            self.window_decorations = Some(s.to_string());
+        if let Some(d) = v
+            .get("windowDecorations")
+            .and_then(Value::as_str)
+            .and_then(WindowDecorations::parse)
+        {
+            self.window_decorations = Some(d);
         }
         if let Some(b) = v.get("hideScrollbar").and_then(Value::as_bool) {
             self.hide_scrollbar = b;
@@ -221,8 +211,11 @@ impl SettingsData {
         if self.force_transcoding {
             o.insert("forceTranscoding".into(), Value::Bool(true));
         }
-        if let Some(s) = &self.window_decorations {
-            o.insert("windowDecorations".into(), Value::String(s.clone()));
+        if let Some(d) = self.window_decorations {
+            o.insert(
+                "windowDecorations".into(),
+                Value::String(d.as_str().to_string()),
+            );
         }
         if !self.hide_scrollbar {
             o.insert("hideScrollbar".into(), Value::Bool(false));
@@ -266,14 +259,8 @@ impl SettingsData {
             "forceTranscoding".into(),
             Value::Bool(self.force_transcoding),
         );
-        o.insert(
-            "windowDecorations".into(),
-            Value::String(
-                self.window_decorations
-                    .clone()
-                    .unwrap_or_else(default_window_decorations),
-            ),
-        );
+        // windowDecorations is absent: resolving its effective value needs the
+        // Platform default, unavailable in the CEF renderer where cli_json runs.
         o.insert("hideScrollbar".into(), Value::Bool(self.hide_scrollbar));
         if !self.device_name.is_empty() {
             o.insert("deviceName".into(), Value::String(self.device_name.clone()));
@@ -356,22 +343,6 @@ fn save_worker_loop(w: &'static SaveWorker) {
     }
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(
-        ".{}.tmp",
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "config".into())
-    ));
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)
-}
-
 fn save_data(path: &Path, data: &SettingsData) -> bool {
     let v = data.to_json();
     let Ok(mut text) = serde_json::to_string_pretty(&v) else {
@@ -379,7 +350,7 @@ fn save_data(path: &Path, data: &SettingsData) -> bool {
     };
     text.push('\n');
     let _guard = SAVE_LOCK.lock();
-    write_atomic(path, text.as_bytes()).is_ok()
+    jfn_paths::write_atomic(path, text.as_bytes()).is_ok()
 }
 
 // =====================================================================
@@ -532,34 +503,28 @@ bool_accessors!(
     transparent_titlebar
 );
 bool_accessors!(force_transcoding, set_force_transcoding, force_transcoding);
-/// Effective window-decoration mode ("csd" | "server" | "serverThemed"): the
-/// user's explicit choice, or the desktop-environment auto default when unset.
-fn resolve_window_decorations() -> String {
-    state()
-        .lock()
-        .data
-        .window_decorations
-        .clone()
-        .unwrap_or_else(default_window_decorations)
+/// Browser-process only: falls back to the installed `Platform`, which panics
+/// if absent.
+pub fn window_decorations_mode() -> WindowDecorations {
+    let configured = state().lock().data.window_decorations;
+    jfn_platform_abi::get().resolve_window_decorations(configured)
 }
 
 pub fn window_decorations() -> String {
-    resolve_window_decorations()
+    window_decorations_mode().as_str().to_string()
 }
 pub fn set_window_decorations(v: &str) {
-    if matches!(v, "csd" | "server" | "serverThemed") {
-        state().lock().data.window_decorations = Some(v.to_string());
+    if let Some(d) = WindowDecorations::parse(v) {
+        state().lock().data.window_decorations = Some(d);
     }
 }
 
 /// True when the app draws its own (client-side) titlebar.
 pub fn client_side_decorations() -> bool {
-    resolve_window_decorations() == "csd"
+    window_decorations_mode() == WindowDecorations::Csd
 }
-/// True when server-side decorations should be tinted to the Jellyfin theme
-/// (KDE palette protocol).
 pub fn titlebar_theme_color() -> bool {
-    resolve_window_decorations() == "serverThemed"
+    window_decorations_mode() == WindowDecorations::ServerThemed
 }
 bool_accessors!(hide_scrollbar, set_hide_scrollbar, hide_scrollbar);
 

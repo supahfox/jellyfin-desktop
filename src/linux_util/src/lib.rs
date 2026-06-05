@@ -8,5 +8,23 @@
 
 #![cfg(target_os = "linux")]
 
+pub mod dmabuf_probe;
+pub mod egl_dyn;
 pub mod idle_inhibit;
 pub mod open_url;
+
+use jfn_platform_abi::WindowDecorations;
+
+/// KDE draws its own server-side decorations and lets us tint them via the
+/// palette protocol; elsewhere (notably GNOME) nothing draws them, so we draw
+/// our own client-side titlebar.
+pub fn default_window_decorations() -> WindowDecorations {
+    let kde = std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|v| v.split(':').any(|s| s.eq_ignore_ascii_case("KDE")))
+        .unwrap_or(false);
+    if kde {
+        WindowDecorations::ServerThemed
+    } else {
+        WindowDecorations::Csd
+    }
+}

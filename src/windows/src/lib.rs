@@ -6,7 +6,7 @@
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::Ordering;
 
-pub use jfn_platform_abi::{DisplayBackend, JfnPopupRequest, JfnRect, Platform};
+pub use jfn_platform_abi::{DisplayBackend, JfnPopupRequest, JfnRect, Platform, WindowDecorations};
 
 mod compositor;
 mod input;
@@ -317,6 +317,10 @@ impl Platform for WindowsPlatform {
         DisplayBackend::Windows
     }
 
+    fn default_window_decorations(&self) -> WindowDecorations {
+        WindowDecorations::ServerThemed
+    }
+
     fn early_init(&self) {
         win_early_init();
     }
@@ -446,8 +450,8 @@ impl Platform for WindowsPlatform {
         win_pump();
     }
 
-    fn set_cursor(&self, t: c_int) {
-        jfn_input_windows_set_cursor(t);
+    fn set_cursor(&self, shape: jfn_platform_abi::cursor::CursorShape) {
+        jfn_input_windows_set_cursor(shape.as_raw());
     }
 
     fn set_idle_inhibit(&self, level: IdleInhibitLevel) {

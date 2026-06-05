@@ -12,7 +12,7 @@ use raw_window_handle::{
 
 use crate::context::GpuContext;
 use crate::error::GpuPaintError;
-use crate::types::{PixelFrame, WindowTarget};
+use crate::types::{DmabufFrame, PixelFrame, WindowTarget};
 
 const SURFACE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
@@ -237,7 +237,51 @@ impl GpuPainter {
             }
         }
 
-        self.draw_and_present()
+        let bind_group = &self.upload.as_ref().unwrap().bind_group;
+        self.draw_and_present(bind_group, None)
+    }
+
+    pub fn push_dmabuf(&mut self, frame: DmabufFrame) -> Result<(), GpuPaintError> {
+        if frame.width == 0 || frame.height == 0 {
+            return Err(GpuPaintError::BadDimensions(frame.width, frame.height));
+        }
+        let max = self.ctx.device.limits().max_texture_dimension_2d;
+        if frame.width > max || frame.height > max {
+            return Err(GpuPaintError::BadDimensions(frame.width, frame.height));
+        }
+        if !self.visible {
+            return Ok(());
+        }
+
+        if (self.config.width, self.config.height) != (frame.width, frame.height) {
+            self.config.width = frame.width;
+            self.config.height = frame.height;
+            self.surface.configure(&self.ctx.device, &self.config);
+            self.upload = None;
+            self.pending_size = (frame.width, frame.height);
+        }
+
+        let (texture, image) = unsafe { crate::dmabuf_import::import(&self.ctx.device, &frame) }?;
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("jfn_gpu_paint dmabuf bg"),
+                layout: &self.bind_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+
+        self.draw_and_present(&bind_group, Some(image))
     }
 
     pub fn shutdown(self) {
@@ -293,7 +337,11 @@ impl GpuPainter {
         }
     }
 
-    fn draw_and_present(&mut self) -> Result<(), GpuPaintError> {
+    fn draw_and_present(
+        &self,
+        bind_group: &wgpu::BindGroup,
+        external_image: Option<u64>,
+    ) -> Result<(), GpuPaintError> {
         use wgpu::CurrentSurfaceTexture::*;
         let frame = match self.surface.get_current_texture() {
             Success(f) | Suboptimal(f) => f,
@@ -311,6 +359,22 @@ impl GpuPainter {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        // The acquire barrier must precede the render pass, in its own
+        // command buffer: wgpu 29 forbids mixing raw HAL encoding
+        // (`as_hal_mut`) and normal wgpu encoding on one CommandEncoder.
+        if let Some(image) = external_image {
+            let mut acquire_encoder =
+                self.ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("jfn_gpu_paint dmabuf acquire enc"),
+                    });
+            crate::dmabuf_import::acquire_barrier(&self.ctx.device, &mut acquire_encoder, image);
+            self.ctx
+                .queue
+                .submit(std::iter::once(acquire_encoder.finish()));
+        }
+
         let mut encoder = self
             .ctx
             .device
@@ -318,7 +382,6 @@ impl GpuPainter {
                 label: Some("jfn_gpu_paint enc"),
             });
         {
-            let upload = self.upload.as_ref().expect("upload texture initialized");
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("jfn_gpu_paint pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -336,7 +399,7 @@ impl GpuPainter {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &upload.bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         self.ctx.queue.submit(std::iter::once(encoder.finish()));

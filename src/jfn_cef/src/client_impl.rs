@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use crate::app::userfree_to_string;
 use crate::client::Inner;
+use crate::ipc::BrowserMessage;
 use crate::platform_ops;
+use jfn_platform_abi::cursor::CursorShape;
 
 #[cfg(target_os = "linux")]
 type CursorHandle = std::os::raw::c_ulong;
@@ -142,27 +144,9 @@ wrap_client! {
                     1
                 }
                 _ => {
-                    // The callback adopts one owning reference for each ptr (CToCpp Wrap).
-                    // Rust still holds its own ref via the Browser/ListValue wrappers,
-                    // so add_ref before transferring ownership.
-                    let browser_raw = browser
-                        .map(|b| {
-                            unsafe { Rc::add_ref(b) };
-                            ImplBrowser::get_raw(b) as *mut c_void
-                        })
-                        .unwrap_or(std::ptr::null_mut());
-                    let args_raw = args
-                        .as_ref()
-                        .map(|a| {
-                            unsafe { Rc::add_ref(a) };
-                            ImplListValue::get_raw(a) as *mut c_void
-                        })
-                        .unwrap_or(std::ptr::null_mut());
-                    if self.inner.invoke_message_handler(&name, args_raw, browser_raw) {
-                        1
-                    } else {
-                        0
-                    }
+                    let browser = browser.map(|b| b.clone());
+                    let message = BrowserMessage::new(name, args, browser);
+                    if self.inner.invoke_message_handler(message) { 1 } else { 0 }
                 }
             }
         }
@@ -461,7 +445,9 @@ wrap_display_handler! {
             _custom_cursor_info: Option<&CursorInfo>,
         ) -> c_int {
             let t: sys::cef_cursor_type_t = type_.into();
-            self.inner.on_cursor_change(t as c_int);
+            if let Some(shape) = CursorShape::from_cef(t as i32) {
+                self.inner.emit_cursor(shape);
+            }
             1
         }
         fn on_console_message(

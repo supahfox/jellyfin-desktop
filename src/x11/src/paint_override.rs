@@ -1,14 +1,12 @@
-//! CLI-driven X11 paint-mode override. Set once by `app.rs` before
-//! `early_init`; read by `lifecycle::init` to bypass the Vulkan probe.
+//! CLI-driven X11 paint preference. Must be set before `early_init`, since the
+//! backing `OnceLock` ignores later writes.
 
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum X11PaintOverride {
-    /// Force the Vulkan pixel-upload path. Hard-fails init if no
-    /// usable adapter is available.
+    Dmabuf,
     Gpu,
-    /// Force the MIT-SHM CPU path. Skips Vulkan init entirely.
     Shm,
 }
 

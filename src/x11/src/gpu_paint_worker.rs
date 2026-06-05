@@ -2,14 +2,39 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
-use jfn_gpu_paint::{DirtyRect, GpuContext, GpuPainter, PixelFrame, WindowTarget};
+use jfn_gpu_paint::{DirtyRect, DmabufFrame, GpuContext, GpuPainter, PixelFrame, WindowTarget};
+use x11rb::connection::Connection;
+use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt as _};
+use x11rb::rust_connection::RustConnection;
 
-struct PendingFrame {
-    pixels: Vec<u8>,
-    dirty: Vec<DirtyRect>,
-    width: u32,
-    height: u32,
-    stride: u32,
+fn configure_window_size(conn: &RustConnection, window: u32, w: u32, h: u32) {
+    let aux = ConfigureWindowAux::new().width(w).height(h);
+    if let Err(e) = conn
+        .configure_window(window, &aux)
+        .and_then(|_| conn.flush())
+    {
+        tracing::warn!("[x11] gpu_paint worker failed to resize target window: {e}");
+    }
+}
+
+enum PendingFrame {
+    Pixels {
+        pixels: Vec<u8>,
+        dirty: Vec<DirtyRect>,
+        width: u32,
+        height: u32,
+        stride: u32,
+    },
+    Dmabuf(DmabufFrame),
+}
+
+impl PendingFrame {
+    fn size(&self) -> (u32, u32) {
+        match self {
+            PendingFrame::Pixels { width, height, .. } => (*width, *height),
+            PendingFrame::Dmabuf(f) => (f.width, f.height),
+        }
+    }
 }
 
 struct WorkerState {
@@ -99,7 +124,7 @@ impl X11GpuPaintWorker {
         if pixels.len() < len {
             return false;
         }
-        let frame = PendingFrame {
+        let frame = PendingFrame::Pixels {
             pixels: pixels[..len].to_vec(),
             dirty,
             width,
@@ -110,6 +135,19 @@ impl X11GpuPaintWorker {
         let mut state = lock.lock().unwrap();
         // Latest-frame only: replace any frame the presenter has not consumed.
         state.pending = Some(frame);
+        cv.notify_one();
+        true
+    }
+
+    pub(crate) fn submit_dmabuf(&self, frame: DmabufFrame) -> bool {
+        if self.failed() {
+            return false;
+        }
+        let (lock, cv) = &*self.shared;
+        let mut state = lock.lock().unwrap();
+        // Latest-frame only: a superseded dmabuf frame drops here, closing
+        // its fds.
+        state.pending = Some(PendingFrame::Dmabuf(frame));
         cv.notify_one();
         true
     }
@@ -135,6 +173,13 @@ fn run_worker(
     failed: Arc<AtomicBool>,
 ) {
     let mut painter: Option<GpuPainter> = None;
+
+    let x11_window = match &target {
+        WindowTarget::Xcb { window, .. } => Some(*window),
+        _ => None,
+    };
+    let mut last_configured: Option<(u32, u32)> = None;
+
     let mut target = Some(target);
 
     loop {
@@ -167,7 +212,7 @@ fn run_worker(
                 failed.store(true, Ordering::Release);
                 break;
             };
-            match GpuPainter::new(ctx.clone(), target, (frame.width, frame.height)) {
+            match GpuPainter::new(ctx.clone(), target, frame.size()) {
                 Ok(p) => painter = Some(p),
                 Err(e) => {
                     eprintln!("[x11] gpu_paint worker init failed: {e}; using SHM");
@@ -180,17 +225,48 @@ fn run_worker(
         let painter = painter.as_mut().unwrap();
         painter.set_visible(visible);
         painter.resize(target_size);
-        let pixel_frame = PixelFrame {
-            width: frame.width,
-            height: frame.height,
-            stride: frame.stride,
-            bgra: &frame.pixels,
-            dirty: &frame.dirty,
-        };
-        if let Err(e) = painter.push_pixels(pixel_frame) {
-            eprintln!("[x11] gpu_paint worker push_pixels failed: {e}; using SHM");
-            failed.store(true, Ordering::Release);
-            break;
+        match frame {
+            PendingFrame::Pixels {
+                pixels,
+                dirty,
+                width,
+                height,
+                stride,
+            } => {
+                let pixel_frame = PixelFrame {
+                    width,
+                    height,
+                    stride,
+                    bgra: &pixels,
+                    dirty: &dirty,
+                };
+                if let Err(e) = painter.push_pixels(pixel_frame) {
+                    eprintln!("[x11] gpu_paint worker push_pixels failed: {e}; using SHM");
+                    failed.store(true, Ordering::Release);
+                    break;
+                }
+            }
+            PendingFrame::Dmabuf(dmabuf) => {
+                // Size the overlay before the swapchain reconfigures on present,
+                // so window extent and swapchain extent stay matched.
+                // jfn_x11_surface_resize omits window sizing for the dmabuf tier,
+                // so nothing else does it.
+                if let Some(window) = x11_window {
+                    let size = (dmabuf.width, dmabuf.height);
+                    if last_configured != Some(size)
+                        && let Some(conn) = crate::x11_state::x11rb_conn()
+                    {
+                        configure_window_size(&conn, window, size.0, size.1);
+                        last_configured = Some(size);
+                    }
+                }
+                // Don't latch `failed` here as the pixels path does: with CEF
+                // producing dmabufs there is no per-surface CPU fallback, so
+                // latching would strand the surface with no output.
+                if let Err(e) = painter.push_dmabuf(dmabuf) {
+                    tracing::warn!("[x11] gpu_paint worker push_dmabuf failed: {e}");
+                }
+            }
         }
     }
 

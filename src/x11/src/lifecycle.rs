@@ -1,104 +1,130 @@
 //! X11 init/cleanup/clamp and helpers for atom interning, ARGB visual
 //! discovery, parent geometry queries, and overlay repositioning.
 
-use std::sync::Arc;
+use x11rb::connection::Connection as X11rbConnection;
+use x11rb::protocol::shm::ConnectionExt as X11rbShmConnection;
+use x11rb::protocol::xproto::{ConnectionExt as X11rbXprotoConnection, Screen, VisualClass};
+use x11rb::rust_connection::RustConnection;
 
-use xcb::{Xid, XidNew, x};
-
-use crate::x11_state::{Atoms, CONN, MUT, Mutable, is_none_gc, is_none_window};
+use crate::x11_state::{Atoms, MUT, Mutable, X11RB_CONN, is_none_gc, is_none_window};
 
 use jfn_mpv::api::jfn_mpv_get_property_int;
 
+fn paint_name(mode: crate::paint_override::X11PaintOverride) -> &'static str {
+    use crate::paint_override::X11PaintOverride as M;
+    match mode {
+        M::Dmabuf => "dmabuf",
+        M::Gpu => "gpu",
+        M::Shm => "shm",
+    }
+}
+
+fn cef_dmabuf_producer_ok() -> bool {
+    let ozone = jfn_platform_abi::get().cef_ozone_platform();
+    unsafe { jfn_linux_util::dmabuf_probe::jfn_wl_dmabuf_probe(ozone, std::ptr::null_mut()) }
+}
+
 /// Find a 32-bit TrueColor visual.
-fn find_argb_visual(screen: &x::Screen) -> Option<x::Visualid> {
+fn find_argb_visual(screen: &Screen) -> Option<u32> {
     screen
-        .allowed_depths()
-        .filter(|d| d.depth() == 32)
-        .flat_map(|d| d.visuals())
-        .find(|v| v.class() == x::VisualClass::TrueColor)
-        .map(|v| v.visual_id())
+        .allowed_depths
+        .iter()
+        .filter(|d| d.depth == 32)
+        .flat_map(|d| d.visuals.iter())
+        .find(|v| v.class == VisualClass::TRUE_COLOR)
+        .map(|v| v.visual_id)
 }
 
-fn intern_atom(conn: &xcb::Connection, name: &[u8]) -> x::Atom {
-    let cookie = conn.send_request(&x::InternAtom {
-        only_if_exists: false,
-        name,
-    });
-    conn.wait_for_reply(cookie)
-        .map(|r| r.atom())
-        .unwrap_or(x::ATOM_NONE)
+fn intern_atom(conn: &RustConnection, name: &[u8]) -> u32 {
+    conn.intern_atom(false, name)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .map(|r| r.atom)
+        .unwrap_or(0)
 }
 
-/// Query the parent window's absolute screen position + size. Returns
-/// None on protocol failure.
-pub fn query_parent_geometry(
-    conn: &xcb::Connection,
-    parent: x::Window,
-    root: x::Window,
+pub(crate) const COMPOSITOR_NOT_DETECTED_MSG: &str =
+    "X11 compositing manager not detected. CEF overlays will not be transparent";
+pub(crate) const COMPOSITOR_DETECTED_MSG: &str = "X11 compositing manager detected";
+
+pub(crate) fn cm_atom_name(screen_num: i32) -> String {
+    format!("_NET_WM_CM_S{screen_num}")
+}
+
+fn compositor_present(conn: &RustConnection, screen_num: i32) -> bool {
+    let atom = intern_atom(conn, cm_atom_name(screen_num).as_bytes());
+    match conn.get_selection_owner(atom).map(|c| c.reply()) {
+        Ok(Ok(reply)) => reply.owner != x11rb::NONE,
+        _ => true,
+    }
+}
+
+pub(crate) fn query_parent_geometry_x11rb(
+    conn: &RustConnection,
+    parent: u32,
+    root: u32,
 ) -> Option<(i32, i32, i32, i32)> {
-    let geo_cookie = conn.send_request(&x::GetGeometry {
-        drawable: x::Drawable::Window(parent),
-    });
-    let geo = conn.wait_for_reply(geo_cookie).ok()?;
-    let trans_cookie = conn.send_request(&x::TranslateCoordinates {
-        src_window: parent,
-        dst_window: root,
-        src_x: 0,
-        src_y: 0,
-    });
-    let trans = conn.wait_for_reply(trans_cookie).ok()?;
+    let geo = conn.get_geometry(parent).ok()?.reply().ok()?;
+    let trans = conn
+        .translate_coordinates(parent, root, 0, 0)
+        .ok()?
+        .reply()
+        .ok()?;
     Some((
-        trans.dst_x() as i32,
-        trans.dst_y() as i32,
-        geo.width() as i32,
-        geo.height() as i32,
+        trans.dst_x as i32,
+        trans.dst_y as i32,
+        geo.width as i32,
+        geo.height as i32,
     ))
 }
 
-/// Reposition every live surface to match mpv's parent window. Called
-/// from the input thread on ConfigureNotify. Caller must hold `MUT`.
-pub fn sync_overlay_positions_locked(conn: &xcb::Connection, m: &mut Mutable) {
-    let Some((px, py, pw, ph)) = query_parent_geometry(conn, m.parent, m.root) else {
-        return;
-    };
-    m.parent_x = px;
-    m.parent_y = py;
-
-    for &s_ptr in &m.live {
-        if s_ptr.is_null() {
-            continue;
-        }
-        let s = unsafe { &*s_ptr };
-        if is_none_window(s.window) || !s.visible {
-            continue;
-        }
-        conn.send_request(&x::ConfigureWindow {
-            window: s.window,
-            value_list: &[
-                x::ConfigWindow::X(px),
-                x::ConfigWindow::Y(py),
-                x::ConfigWindow::Width(pw as u32),
-                x::ConfigWindow::Height(ph as u32),
-            ],
-        });
-    }
-    let _ = conn.flush();
+#[derive(Copy, Clone)]
+pub(crate) struct OverlaySnap {
+    pub window: u32,
+    pub visible: bool,
+    /// False on the dmabuf tier once a worker exists: the GPU worker sizes the
+    /// window in lockstep, so the geometry thread must not drive size too.
+    pub send_size: bool,
 }
 
-pub fn hide_all_live_locked(conn: &xcb::Connection, m: &Mutable) {
+pub(crate) fn snapshot_live_overlays_locked(m: &Mutable) -> Vec<OverlaySnap> {
+    m.live
+        .iter()
+        .filter(|&&s_ptr| !s_ptr.is_null())
+        .map(|&s_ptr| unsafe { &*s_ptr })
+        .filter(|s| !is_none_window(s.window))
+        .map(|s| OverlaySnap {
+            window: s.window,
+            visible: s.visible,
+            send_size: !(m.use_dmabuf && s.gpu_paint_worker.is_some()),
+        })
+        .collect()
+}
+
+pub(crate) fn set_parent_geometry_locked(m: &mut Mutable, px: i32, py: i32, pw: i32, ph: i32) {
+    m.parent_x = px;
+    m.parent_y = py;
+    m.pw = pw;
+    m.ph = ph;
+}
+
+pub fn hide_all_live_locked(m: &Mutable) {
+    let Some(conn) = crate::x11_state::x11rb_conn() else {
+        return;
+    };
     for &s_ptr in &m.live {
         if s_ptr.is_null() {
             continue;
         }
         let s = unsafe { &*s_ptr };
         if !is_none_window(s.window) {
-            conn.send_request(&x::UnmapWindow { window: s.window });
+            let _ = conn.unmap_window(s.window);
         }
     }
     let _ = conn.flush();
 }
 
-/// Platform init. Opens the xcb connection, finds the ARGB visual,
+/// Platform init. Opens X11 connections, finds the ARGB visual,
 /// interns atoms, queries parent geometry, and starts the input thread.
 pub fn init() -> bool {
     let mut wid: i64 = 0;
@@ -108,22 +134,30 @@ pub fn init() -> bool {
         eprintln!("[x11] failed to get window-id from mpv");
         return false;
     }
-    let parent = x::Window::new(wid as u32);
+    let parent = wid as u32;
 
-    let (conn, screen_num) = match xcb::Connection::connect(None) {
-        Ok(v) => v,
+    let (x11rb_conn, screen_num) = match RustConnection::connect(None) {
+        Ok((conn, screen_num)) => (std::sync::Arc::new(conn), screen_num as i32),
         Err(e) => {
-            eprintln!("[x11] failed to connect: {e:?}");
+            eprintln!("[x11] failed to connect x11rb control connection: {e:?}");
             return false;
         }
     };
+    if let Err(e) = crate::x11_state::open_xcb_connection() {
+        eprintln!("[x11] failed to connect xcb interop/input connection: {e}");
+        return false;
+    }
 
-    let setup = conn.get_setup();
-    let Some(screen) = setup.roots().nth(screen_num as usize) else {
+    let setup = x11rb_conn.setup();
+    let Some(screen) = setup.roots.get(screen_num as usize) else {
         eprintln!("[x11] no screen at index {screen_num}");
         return false;
     };
-    let root = screen.root();
+    let root = screen.root;
+
+    if !compositor_present(&x11rb_conn, screen_num) {
+        tracing::error!(target: "Platform", "{COMPOSITOR_NOT_DETECTED_MSG}");
+    }
 
     let argb_depth: u8 = 32;
     let Some(argb_visual) = find_argb_visual(screen) else {
@@ -131,74 +165,95 @@ pub fn init() -> bool {
         return false;
     };
 
-    let colormap: x::Colormap = conn.generate_id();
-    conn.send_request(&x::CreateColormap {
-        alloc: x::ColormapAlloc::None,
-        mid: colormap,
-        window: root,
-        visual: argb_visual,
-    });
+    let Ok(colormap_id) = x11rb_conn.generate_id() else {
+        eprintln!("[x11] failed to allocate colormap id");
+        return false;
+    };
+    let colormap = colormap_id;
+    if x11rb_conn
+        .create_colormap(
+            x11rb::protocol::xproto::ColormapAlloc::NONE,
+            colormap_id,
+            root,
+            argb_visual,
+        )
+        .is_err()
+    {
+        eprintln!("[x11] failed to create colormap");
+        return false;
+    }
 
     let atoms = Atoms {
-        net_wm_opacity: intern_atom(&conn, b"_NET_WM_WINDOW_OPACITY"),
-        net_wm_window_type: intern_atom(&conn, b"_NET_WM_WINDOW_TYPE"),
-        net_wm_window_type_notification: intern_atom(&conn, b"_NET_WM_WINDOW_TYPE_NOTIFICATION"),
-        net_wm_state: intern_atom(&conn, b"_NET_WM_STATE"),
-        net_wm_state_above: intern_atom(&conn, b"_NET_WM_STATE_ABOVE"),
-        net_wm_state_skip_taskbar: intern_atom(&conn, b"_NET_WM_STATE_SKIP_TASKBAR"),
-        net_wm_state_skip_pager: intern_atom(&conn, b"_NET_WM_STATE_SKIP_PAGER"),
-        wm_protocols: intern_atom(&conn, b"WM_PROTOCOLS"),
-        wm_delete_window: intern_atom(&conn, b"WM_DELETE_WINDOW"),
+        net_wm_window_type: intern_atom(&x11rb_conn, b"_NET_WM_WINDOW_TYPE"),
+        net_wm_window_type_normal: intern_atom(&x11rb_conn, b"_NET_WM_WINDOW_TYPE_NORMAL"),
+        net_wm_state: intern_atom(&x11rb_conn, b"_NET_WM_STATE"),
+        net_wm_state_skip_taskbar: intern_atom(&x11rb_conn, b"_NET_WM_STATE_SKIP_TASKBAR"),
+        net_wm_state_skip_pager: intern_atom(&x11rb_conn, b"_NET_WM_STATE_SKIP_PAGER"),
+        net_wm_state_fullscreen: intern_atom(&x11rb_conn, b"_NET_WM_STATE_FULLSCREEN"),
+        wm_protocols: intern_atom(&x11rb_conn, b"WM_PROTOCOLS"),
+        wm_delete_window: intern_atom(&x11rb_conn, b"WM_DELETE_WINDOW"),
+        motif_wm_hints: intern_atom(&x11rb_conn, b"_MOTIF_WM_HINTS"),
+        net_active_window: intern_atom(&x11rb_conn, b"_NET_ACTIVE_WINDOW"),
     };
 
     // Verify the MIT-SHM extension is present.
-    let shm_cookie = conn.send_request(&xcb::shm::QueryVersion {});
-    if conn.wait_for_reply(shm_cookie).is_err() {
-        eprintln!("[x11] MIT-SHM extension not available");
+    let shm_ok = x11rb_conn
+        .shm_query_version()
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .is_some();
+    if !shm_ok {
+        tracing::error!("MIT-SHM extension not available");
         return false;
     }
 
     let (parent_x, parent_y, pw, ph) =
-        query_parent_geometry(&conn, parent, root).unwrap_or((0, 0, 1, 1));
+        query_parent_geometry_x11rb(&x11rb_conn, parent, root).unwrap_or((0, 0, 1, 1));
 
-    // Probe + initialize the Vulkan compositor. `--x11-paint` skips
-    // the probe in either direction; otherwise failure is benign and
-    // surface presents fall back to SHM upload.
-    let (gpu_ctx, gpu_caps) = match crate::paint_override::paint_override() {
-        Some(crate::paint_override::X11PaintOverride::Shm) => {
-            eprintln!("[x11] --x11-paint=shm: forcing SHM");
-            (None, jfn_gpu_paint::Capabilities::NONE)
-        }
-        Some(crate::paint_override::X11PaintOverride::Gpu) => {
+    // Resolve the paint preference down the dmabuf → gpu → shm chain, where
+    // `--platform-paint` only picks the entry tier and an unusable tier degrades
+    // to the next.
+    use crate::paint_override::X11PaintOverride as Req;
+    let requested = crate::paint_override::paint_override();
+    let explicit = requested.is_some();
+    let want_gpu = !matches!(requested, Some(Req::Shm));
+    let want_dmabuf = matches!(requested, None | Some(Req::Dmabuf));
+    let (gpu_ctx, gpu_caps, use_dmabuf, resolved) = if want_gpu {
+        let caps = jfn_gpu_paint::GpuContext::probe();
+        if caps.gpu_available {
             match jfn_gpu_paint::GpuContext::new() {
                 Ok(c) => {
                     let caps = c.capabilities();
-                    eprintln!("[x11] --x11-paint=gpu: Vulkan context initialised");
-                    (Some(c), caps)
-                }
-                Err(e) => {
-                    eprintln!("[x11] --x11-paint=gpu requested but init failed: {e}");
-                    return false;
-                }
-            }
-        }
-        None => {
-            let caps = jfn_gpu_paint::GpuContext::probe();
-            let ctx = if caps.gpu_available {
-                match jfn_gpu_paint::GpuContext::new() {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        eprintln!("[x11] gpu_paint context init failed: {e}; using SHM");
-                        None
+                    // caps.dmabuf_import only proves our Vulkan side can consume;
+                    // also probe CEF's producer, broken on NVIDIA proprietary X11.
+                    if want_dmabuf && caps.dmabuf_import && cef_dmabuf_producer_ok() {
+                        tracing::info!("paint: dmabuf import");
+                        (Some(c), caps, true, Req::Dmabuf)
+                    } else {
+                        tracing::info!("paint: Vulkan pixel-upload");
+                        (Some(c), caps, false, Req::Gpu)
                     }
                 }
-            } else {
-                eprintln!("[x11] no Vulkan adapter; using SHM");
-                None
-            };
-            (ctx, caps)
+                Err(e) => {
+                    tracing::info!("paint: Vulkan init failed: {e}; using SHM");
+                    (None, jfn_gpu_paint::Capabilities::NONE, false, Req::Shm)
+                }
+            }
+        } else {
+            tracing::info!("paint: no Vulkan adapter; using SHM");
+            (None, jfn_gpu_paint::Capabilities::NONE, false, Req::Shm)
         }
+    } else {
+        tracing::info!("paint: using SHM");
+        (None, jfn_gpu_paint::Capabilities::NONE, false, Req::Shm)
     };
+    if explicit && requested != Some(resolved) {
+        tracing::warn!(
+            "--platform-paint={} unavailable; using {}",
+            paint_name(requested.unwrap()),
+            paint_name(resolved)
+        );
+    }
 
     // Populate the global mutable state.
     {
@@ -214,45 +269,44 @@ pub fn init() -> bool {
             parent_y,
             pw,
             ph,
+            parent_fullscreen: false,
             cached_scale: 1.0,
             atoms,
             live: Vec::new(),
             gpu_ctx,
             gpu_caps,
+            use_dmabuf,
+            gate: jfn_compositor_core::transition::TransitionGate::new(),
         });
     }
 
-    let conn = Arc::new(conn);
-    if CONN.set(conn.clone()).is_err() {
-        eprintln!("[x11] connection already initialized");
+    if X11RB_CONN.set(x11rb_conn).is_err() {
+        eprintln!("[x11] x11rb connection already initialized");
         return false;
     }
 
-    // Spawn input thread on mpv's parent window. Configure callback runs
-    // `sync_overlay_positions_locked`; shutdown callback hides surfaces.
-    crate::input_lifecycle::start(conn.clone(), parent);
+    crate::input_lifecycle::start(parent);
+    crate::geometry::start(parent, root);
 
-    eprintln!(
-        "[x11] platform initialized (parent=0x{:x})",
-        parent.resource_id()
-    );
+    eprintln!("[x11] platform initialized (parent=0x{:x})", parent);
     true
 }
 
 pub fn cleanup() {
     // Defensively unmap any straggler surface windows.
-    if let Some(conn) = crate::x11_state::conn() {
+    {
         let g = MUT.lock();
         if let Some(m) = g.as_ref() {
-            hide_all_live_locked(&conn, m);
+            hide_all_live_locked(m);
         }
     }
 
     jfn_linux_util::idle_inhibit::cleanup();
+    crate::geometry::cleanup();
     crate::input_lifecycle::cleanup();
 
     // Free any surface that outlived Browsers (defensive).
-    if let Some(conn) = crate::x11_state::conn() {
+    if let Some(conn) = crate::x11_state::x11rb_conn() {
         let mut g = MUT.lock();
         if let Some(m) = g.as_mut() {
             for &s_ptr in &m.live {
@@ -267,16 +321,16 @@ pub fn cleanup() {
                     worker.shutdown();
                 }
                 if !is_none_gc(s.gc) {
-                    conn.send_request(&x::FreeGc { gc: s.gc });
+                    let _ = conn.free_gc(s.gc);
                 }
                 if !is_none_window(s.window) {
-                    conn.send_request(&x::DestroyWindow { window: s.window });
+                    let _ = conn.destroy_window(s.window);
                 }
                 drop(unsafe { Box::from_raw(s_ptr) });
             }
             m.live.clear();
-            if m.colormap.resource_id() != 0 {
-                conn.send_request(&x::FreeColormap { cmap: m.colormap });
+            if m.colormap != 0 {
+                let _ = conn.free_colormap(m.colormap);
             }
         }
         let _ = conn.flush();
@@ -286,15 +340,14 @@ pub fn cleanup() {
 /// Clamp saved window geometry to the primary screen extent. Runs before
 /// `init()` so it opens its own short-lived connection.
 pub fn clamp_window_geometry(w: &mut i32, h: &mut i32) {
-    let Ok((conn, _)) = xcb::Connection::connect(None) else {
+    let Ok((conn, screen_num)) = RustConnection::connect(None) else {
         return;
     };
-    let setup = conn.get_setup();
-    let Some(root) = setup.roots().next() else {
+    let Some(root) = conn.setup().roots.get(screen_num) else {
         return;
     };
-    let sw = root.width_in_pixels() as i32;
-    let sh = root.height_in_pixels() as i32;
+    let sw = root.width_in_pixels as i32;
+    let sh = root.height_in_pixels as i32;
     if sw > 0 && *w > sw {
         *w = sw;
     }

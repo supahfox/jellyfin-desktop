@@ -7,7 +7,7 @@ use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::Ordering;
 
 use jfn_platform_abi::geometry::{Bounds, clamp_to_bounds};
-pub use jfn_platform_abi::{DisplayBackend, JfnPopupRequest, JfnRect, Platform};
+pub use jfn_platform_abi::{DisplayBackend, JfnPopupRequest, JfnRect, Platform, WindowDecorations};
 
 // =====================================================================
 // Backend no-op entry points.
@@ -594,6 +594,10 @@ impl Platform for MacosPlatform {
         DisplayBackend::MacOS
     }
 
+    fn default_window_decorations(&self) -> WindowDecorations {
+        WindowDecorations::ServerThemed
+    }
+
     fn early_init(&self) {
         macos_early_init();
     }
@@ -710,8 +714,8 @@ impl Platform for MacosPlatform {
         macos_wake_main_loop();
     }
 
-    fn set_cursor(&self, t: c_int) {
-        jfn_input_macos_set_cursor(t);
+    fn set_cursor(&self, shape: jfn_platform_abi::cursor::CursorShape) {
+        jfn_input_macos_set_cursor(shape.as_raw());
     }
 
     fn set_idle_inhibit(&self, level: IdleInhibitLevel) {
