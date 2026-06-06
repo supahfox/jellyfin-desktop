@@ -44,8 +44,10 @@ fn create_overlay_window(
     let aux = CreateWindowAux::new()
         .background_pixel(0)
         .border_pixel(0)
-        // No override_redirect: the WM must stack the overlay with its transient
-        // parent. override_redirect forces reactive restacking, which flickers.
+        // Managed transient when windowed (the WM stacks/positions it without
+        // flicker); unmanaged only when born into fullscreen, where the WM would
+        // otherwise strut-clamp it below the panel.
+        .override_redirect(u32::from(m.parent_fullscreen))
         .event_mask(EventMask::EXPOSURE)
         .colormap(m.colormap);
     let _ = x11_conn.create_window(
@@ -80,22 +82,15 @@ fn create_overlay_window(
             u32::from(AtomEnum::ATOM),
             &[m.atoms.net_wm_window_type_normal],
         );
-        // The geometry thread only emits the state on a flip, so an overlay born
-        // mid-fullscreen must carry it in its initial property or it never escapes
-        // the strut-reserved area.
-        let mut wm_state = vec![
-            m.atoms.net_wm_state_skip_taskbar,
-            m.atoms.net_wm_state_skip_pager,
-        ];
-        if m.parent_fullscreen {
-            wm_state.push(m.atoms.net_wm_state_fullscreen);
-        }
         let _ = x11_conn.change_property32(
             PropMode::REPLACE,
             win_id,
             m.atoms.net_wm_state,
             u32::from(AtomEnum::ATOM),
-            &wm_state,
+            &[
+                m.atoms.net_wm_state_skip_taskbar,
+                m.atoms.net_wm_state_skip_pager,
+            ],
         );
 
         // Motif hints: flags=MWM_HINTS_DECORATIONS, decorations=0.
@@ -152,6 +147,12 @@ pub fn jfn_x11_alloc_surface() -> *mut PlatformSurface {
     let ph = if m.ph > 0 { m.ph as u32 } else { 1 };
 
     let win = create_overlay_window(&x11_conn, m, px, py, pw, ph);
+    // grab_overlay_input runs on a separate connection; round-trip first so the
+    // window exists server-side, else its requests hit a silently-dropped
+    // BadWindow and the overlay gets no input.
+    if let Ok(cookie) = x11_conn.get_input_focus() {
+        let _ = cookie.reply();
+    }
     crate::input::grab_overlay_input(win);
     let gc = x11_conn.generate_id().unwrap_or(0);
     let _ = x11_conn.create_gc(gc, win, &CreateGCAux::new());
@@ -162,8 +163,19 @@ pub fn jfn_x11_alloc_surface() -> *mut PlatformSurface {
         (*s).pw = pw as i32;
         (*s).ph = ph as i32;
         (*s).visible = true;
+        (*s).fsm_state = Some(crate::overlay_fsm::OverlayState::new_mapped(
+            m.parent_fullscreen,
+        ));
     }
     let _ = x11_conn.map_window(win);
+    // An override_redirect overlay (born fullscreen) is not stacked by the WM;
+    // raise it above the parent ourselves.
+    if m.parent_fullscreen {
+        let aux = ConfigureWindowAux::new()
+            .sibling(m.parent)
+            .stack_mode(StackMode::ABOVE);
+        let _ = x11_conn.configure_window(win, &aux);
+    }
     let _ = x11_conn.flush();
 
     m.live.push(s);
@@ -273,7 +285,9 @@ pub unsafe fn jfn_x11_surface_present_dmabuf(s: *mut PlatformSurface, frame: Dma
         ));
     }
 
-    let worker = surf.gpu_paint_worker.as_ref().unwrap();
+    let Some(worker) = surf.gpu_paint_worker.as_ref() else {
+        return false;
+    };
     worker.set_visible(surf.visible);
     worker.submit_dmabuf(frame)
 }
@@ -338,7 +352,9 @@ fn queue_gpu_present(
         })
         .collect();
 
-    let worker = surf.gpu_paint_worker.as_ref().unwrap();
+    let Some(worker) = surf.gpu_paint_worker.as_ref() else {
+        return false;
+    };
     worker.set_visible(surf.visible);
     worker.resize(size);
     worker.submit_frame(bgra, w as u32, h as u32, owned)
@@ -365,7 +381,9 @@ fn queue_shm_present(
         ));
     }
 
-    let worker = surf.shm_paint_worker.as_ref().unwrap();
+    let Some(worker) = surf.shm_paint_worker.as_ref() else {
+        return false;
+    };
     worker.set_visible(surf.visible);
     worker.submit_frame(buffer, w, h, dirty, dirty_len)
 }

@@ -12,7 +12,7 @@
 use cef::{ImplListValue, ListValue};
 use parking_lot::Mutex;
 use serde_json::Value;
-use std::ffi::{CString, c_char};
+use std::ffi::c_char;
 use std::os::raw::c_void;
 use std::sync::Arc;
 
@@ -32,8 +32,6 @@ use jfn_mpv::boot::jfn_mpv_handle_get;
 use jfn_playback::ingest_driver::jfn_playback_fullscreen;
 use jfn_playback::shutdown::jfn_shutdown_initiate;
 use jfn_playback::{Input as PbInput, MediaType as PbMediaType, post as pb_post};
-
-use jfn_platform_abi::cursor::CursorShape;
 
 use jfn_mpv::api::JfnMpvLoadOptions;
 
@@ -70,7 +68,7 @@ pub fn jfn_web_init(layer: *mut JfnCefLayer) {
         return;
     }
 
-    let name = CString::new("web").unwrap();
+    let name = c"web";
     unsafe { jfn_cef_layer_set_name(layer, name.as_ptr()) };
 
     let inner = unsafe { jfn_cef_layer_inner(layer) };
@@ -408,18 +406,6 @@ fn handle_message(message: BrowserMessage) -> bool {
         }
         "notifySeek" => with_args(args, |a| {
             pb_post(PbInput::Seeked(list_int(a, 0) as i64 * 1000));
-        }),
-        "setCursorVisible" => with_args(args, |a| {
-            let visible = a.bool(0) != 0;
-            let shape = if visible {
-                CursorShape::Pointer
-            } else {
-                CursorShape::None
-            };
-            let inner = INSTANCE.lock().as_ref().map(|s| Arc::clone(&s.layer));
-            if let Some(inner) = inner {
-                inner.emit_cursor(shape);
-            }
         }),
         "appExit" => {
             jfn_shutdown_initiate();

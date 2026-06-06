@@ -11,7 +11,7 @@ use cef::{
     CefString, CefStringUserfreeUtf16, DictionaryValue, ImplDictionaryValue, ImplListValue,
     dictionary_value_create, list_value_create, sys,
 };
-use jfn_platform_abi::WindowDecorations;
+use jfn_platform_abi::{DisplayBackend, WindowDecorations};
 use std::os::raw::c_char;
 use std::sync::OnceLock;
 
@@ -46,7 +46,6 @@ pub(crate) enum NativeFunction {
     SetSettingValue,
     ThemeColor,
     SetOsdVisible,
-    SetCursorVisible,
     ToggleFullscreen,
     GetSavedServerUrl,
     NavigateMain,
@@ -97,7 +96,6 @@ impl NativeFunction {
             "setSettingValue" => Self::SetSettingValue,
             "themeColor" => Self::ThemeColor,
             "setOsdVisible" => Self::SetOsdVisible,
-            "setCursorVisible" => Self::SetCursorVisible,
             "toggleFullscreen" => Self::ToggleFullscreen,
             "getSavedServerUrl" => Self::GetSavedServerUrl,
             "navigateMain" => Self::NavigateMain,
@@ -149,7 +147,6 @@ impl NativeFunction {
             Self::SetSettingValue => "setSettingValue",
             Self::ThemeColor => "themeColor",
             Self::SetOsdVisible => "setOsdVisible",
-            Self::SetCursorVisible => "setCursorVisible",
             Self::ToggleFullscreen => "toggleFullscreen",
             Self::GetSavedServerUrl => "getSavedServerUrl",
             Self::NavigateMain => "navigateMain",
@@ -180,6 +177,7 @@ pub(crate) enum InjectedScript {
     ClientSettings,
     Csd,
     ContextMenu,
+    SelectMenu,
 }
 
 impl InjectedScript {
@@ -193,6 +191,7 @@ impl InjectedScript {
             "client-settings.js" => Self::ClientSettings,
             "csd.js" => Self::Csd,
             "context-menu.js" => Self::ContextMenu,
+            "select-menu.js" => Self::SelectMenu,
             _ => return None,
         })
     }
@@ -207,6 +206,7 @@ impl InjectedScript {
             Self::ClientSettings => "client-settings.js",
             Self::Csd => "csd.js",
             Self::ContextMenu => "context-menu.js",
+            Self::SelectMenu => "select-menu.js",
         }
     }
 }
@@ -241,7 +241,6 @@ const WEB_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::SetSettingValue,
     NativeFunction::ThemeColor,
     NativeFunction::SetOsdVisible,
-    NativeFunction::SetCursorVisible,
     NativeFunction::ToggleFullscreen,
 ];
 
@@ -495,6 +494,9 @@ pub(crate) fn build_for_kind(
                 extra_info.device_profile_json = Some(json.clone());
             }
             extra_info.window_decorations = Some(jfn_config::window_decorations_mode());
+            if jfn_platform_abi::get().display() == DisplayBackend::X11 {
+                extra_info.scripts.push(InjectedScript::SelectMenu);
+            }
             Some(extra_info)
         }
         "overlay" => Some(build_extra_info(
