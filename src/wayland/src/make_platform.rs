@@ -20,8 +20,8 @@ use crate::wl_ops::{self, JfnDmabufFrame};
 
 use jfn_platform_abi::cursor::CursorShape;
 pub use jfn_platform_abi::{
-    DisplayBackend, IdleInhibitLevel, JfnPopupRequest, JfnRect, Platform, SurfaceHandle,
-    SurfaceSize, WindowDecorations,
+    BootGeometry, DisplayBackend, IdleInhibitLevel, JfnContextMenuRequest, JfnPopupRequest,
+    JfnRect, Platform, SurfaceHandle, SurfaceSize, WindowDecorations,
 };
 
 // =====================================================================
@@ -187,54 +187,61 @@ impl Platform for WaylandPlatform {
         wl_ops::restack(typed);
     }
 
-    fn popup_show(&self, s: SurfaceHandle, req: JfnPopupRequest) {
-        wl_ops::popup_show(
-            s as *mut crate::wl_state::PlatformSurface,
-            req.x,
-            req.y,
-            req.lw,
-            req.lh,
-        );
-        // Dropping `req.on_selected` here is the cancel path — CEF
-        // dispatches selection itself on this backend.
+    fn popup_show(&self, _s: SurfaceHandle, req: JfnPopupRequest) {
+        // Render `<select>` dropdowns with our own menu code (as a grabbed
+        // xdg_popup), matching the context menu. CEF still spins up its own OSR
+        // popup underneath; its pixels are suppressed (see popup_present*) and
+        // its widget is cancelled when on_selected fires.
+        let items = req
+            .options
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| jfn_menu::MenuItem {
+                id: i as c_int,
+                label,
+                enabled: true,
+                separator: false,
+            })
+            .collect();
+        let cb = req.on_selected.unwrap_or_else(|| Box::new(|_| {}));
+        crate::popup::show_highlighted(items, req.x, req.y, req.lw, req.initial_highlight, cb);
     }
 
-    fn popup_hide(&self, s: SurfaceHandle) {
-        wl_ops::popup_hide(s as *mut crate::wl_state::PlatformSurface);
+    fn context_menu_show(&self, _s: SurfaceHandle, req: JfnContextMenuRequest) {
+        let items = req
+            .items
+            .into_iter()
+            .map(|i| jfn_menu::MenuItem {
+                id: i.id,
+                label: i.label,
+                enabled: i.enabled,
+                separator: i.separator,
+            })
+            .collect();
+        let cb = req.on_selected.unwrap_or_else(|| Box::new(|_| {}));
+        crate::popup::show(items, req.x, req.y, cb);
     }
 
-    fn popup_present(&self, s: SurfaceHandle, info: *const c_void, lw: c_int, lh: c_int) {
-        let Some(frame) = (unsafe { to_dmabuf_frame(info) }) else {
-            return;
-        };
-        wl_ops::popup_present(s as *mut crate::wl_state::PlatformSurface, &frame, lw, lh);
+    fn popup_hide(&self, _s: SurfaceHandle) {
+        // CEF hid its `<select>` widget — tear down our native menu too.
+        crate::popup::hide();
+    }
+
+    fn popup_present(&self, _s: SurfaceHandle, _info: *const c_void, _lw: c_int, _lh: c_int) {
+        // `<select>` is rendered natively (popup_show); CEF's own popup pixels
+        // are dropped.
     }
 
     fn popup_present_software(
         &self,
-        s: SurfaceHandle,
-        buffer: *const c_void,
-        pw: c_int,
-        ph: c_int,
-        lw: c_int,
-        lh: c_int,
+        _s: SurfaceHandle,
+        _buffer: *const c_void,
+        _pw: c_int,
+        _ph: c_int,
+        _lw: c_int,
+        _lh: c_int,
     ) {
-        if buffer.is_null() || pw <= 0 || ph <= 0 {
-            return;
-        }
-        let len = (pw as usize)
-            .checked_mul(ph as usize)
-            .and_then(|n| n.checked_mul(4));
-        let Some(len) = len else { return };
-        let pixels = unsafe { std::slice::from_raw_parts(buffer as *const u8, len) };
-        wl_ops::popup_present_software(
-            s as *mut crate::wl_state::PlatformSurface,
-            pixels,
-            pw,
-            ph,
-            lw,
-            lh,
-        );
+        // See popup_present — CEF's popup pixels are dropped.
     }
 
     fn set_fullscreen(&self, v: bool) {
@@ -282,6 +289,11 @@ impl Platform for WaylandPlatform {
         if s > 0.0 { s as f32 } else { 1.0 }
     }
 
+    fn apply_boot_geometry(&self, g: &BootGeometry) {
+        jfn_wlproxy::jfn_wlproxy_set_initial_size(g.logical.w, g.logical.h);
+        jfn_wlproxy::jfn_wlproxy_set_initial_maximized(g.maximized);
+    }
+
     fn set_cursor(&self, shape: CursorShape) {
         crate::input_lifecycle::set_cursor_active(shape);
     }
@@ -290,12 +302,15 @@ impl Platform for WaylandPlatform {
         jfn_linux_util::idle_inhibit::set(level as u32);
     }
 
-    fn set_theme_color(&self, _rgb: u32) {
+    fn set_theme_color(&self, rgb: u32) {
+        let r = ((rgb >> 16) & 0xFF) as u8;
+        let g = ((rgb >> 8) & 0xFF) as u8;
+        let b = (rgb & 0xFF) as u8;
+
+        jfn_wlproxy::jfn_wlproxy_set_background_color(r, g, b);
+
         #[cfg(feature = "kde-palette")]
         {
-            let r = ((_rgb >> 16) & 0xFF) as u8;
-            let g = ((_rgb >> 8) & 0xFF) as u8;
-            let b = (_rgb & 0xFF) as u8;
             // hex string "#RRGGBB\0".
             let mut hex: [u8; 8] = [0; 8];
             hex[0] = b'#';

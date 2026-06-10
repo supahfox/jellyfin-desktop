@@ -45,7 +45,7 @@ unsafe fn surface_mut<'a>(p: *mut PlatformSurface) -> &'a mut PlatformSurface {
 
 pub(crate) fn alloc_surface() -> *mut PlatformSurface {
     let ptr = new_boxed();
-    let st = lock();
+    let mut st = lock();
     // SAFETY: ptr is freshly heap-allocated; no aliases yet.
     let s = unsafe { surface_mut(ptr) };
 
@@ -72,6 +72,10 @@ pub(crate) fn alloc_surface() -> *mut PlatformSurface {
     s.subsurface = Some(subsurface);
     s.viewport = viewport;
 
+    crate::scene::dispatch(
+        &mut st,
+        crate::scene::SceneEvent::LayerAdded(crate::scene::LayerId(ptr as usize)),
+    );
     ptr
 }
 
@@ -99,6 +103,13 @@ pub(crate) fn free_surface(ptr: *mut PlatformSurface) {
         // Drop from stack if still present.
         st.stack.retain(|p| *p != ptr);
 
+        // Update the scene before tearing down wl objects: dismissing a menu
+        // anchored here requires this layer's surface to still be alive.
+        crate::scene::dispatch(
+            &mut st,
+            crate::scene::SceneEvent::LayerRemoved(crate::scene::LayerId(ptr as usize)),
+        );
+
         // SAFETY: stack drop above guarantees no aliases via stack;
         // caller (C++) guarantees no concurrent use of `ptr`.
         let s = unsafe { surface_mut(ptr) };
@@ -124,21 +135,12 @@ pub(crate) fn restack(ordered: &[*mut PlatformSurface]) {
     let mut st = lock();
     st.stack.clear();
     st.stack.extend_from_slice(ordered);
-    let mut prev: &wayland_client::protocol::wl_surface::WlSurface = &st.parent;
-    for &p in ordered {
-        if p.is_null() {
-            continue;
-        }
-        // SAFETY: stack pointers are valid for the lifetime of this call;
-        // surface_mut borrows disjoint heap allocations.
-        let s = unsafe { surface_mut(p) };
-        let (Some(sub), Some(surf)) = (s.subsurface.as_ref(), s.surface.as_ref()) else {
-            continue;
-        };
-        sub.place_above(prev);
-        prev = surf;
-    }
-    st.flush();
+    let order: Vec<crate::scene::LayerId> = ordered
+        .iter()
+        .filter(|p| !p.is_null())
+        .map(|p| crate::scene::LayerId(*p as usize))
+        .collect();
+    crate::scene::dispatch(&mut st, crate::scene::SceneEvent::Restack(order));
 }
 
 // =====================================================================

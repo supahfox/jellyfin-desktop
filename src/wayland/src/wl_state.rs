@@ -30,7 +30,7 @@ use crate::gpu_paint_worker::WaylandGpuPaintWorker;
 use crate::shm_paint_worker::WaylandShmPaintWorker;
 
 use memmap2::MmapOptions;
-use wayland_backend::client::{Backend, ObjectId};
+use wayland_backend::client::Backend;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
@@ -178,6 +178,9 @@ pub(crate) struct WlState {
     /// `wl_surface.attach`/`viewport.set_destination` work for the
     /// gpu_paint surface.
     pub use_gpu_paint: bool,
+
+    pub scene: crate::scene::Scene,
+    pub menu_io: crate::popup::MenuIo,
 }
 
 // Raw pointers in `stack` are only ever dereferenced under the Mutex
@@ -256,18 +259,13 @@ noop_dispatch!(
 // remains mpv's responsibility.
 // =====================================================================
 
-/// SAFETY: `display_ptr` must be a live `*mut wl_display` owned by an
-/// external party (mpv); `parent_surface_ptr` must be a live
-/// `*mut wl_proxy` referring to a `wl_surface` on that display.
-pub(crate) unsafe fn init(
-    display_ptr: *mut c_void,
-    parent_surface_ptr: *mut c_void,
-) -> Result<(), String> {
+/// SAFETY: `display_ptr` must be a live `*mut wl_display` owned by mpv.
+pub(crate) unsafe fn init(display_ptr: *mut c_void) -> Result<(), String> {
     if STATE.get().is_some() {
         return Err("wl_state already initialised".into());
     }
-    if display_ptr.is_null() || parent_surface_ptr.is_null() {
-        return Err("null display or parent surface".into());
+    if display_ptr.is_null() {
+        return Err("null display".into());
     }
 
     let backend = unsafe { Backend::from_foreign_display(display_ptr.cast()) };
@@ -288,15 +286,8 @@ pub(crate) unsafe fn init(
     let dmabuf: Option<ZwpLinuxDmabufV1> = globals.bind(&qh, 1..=4, ()).ok();
     let viewporter: Option<WpViewporter> = globals.bind(&qh, 1..=1, ()).ok();
 
-    // Wrap mpv's parent surface as a Proxy. Foreign object — never
-    // destroyed on our side (Drop on a non-rust-managed ObjectId is a
-    // no-op in wayland-backend).
-    let parent_id = unsafe {
-        ObjectId::from_ptr(WlSurface::interface(), parent_surface_ptr.cast())
-            .map_err(|_| "parent surface interface mismatch")?
-    };
-    let parent = WlSurface::from_id(&conn, parent_id)
-        .map_err(|_| "parent surface from_id failed".to_string())?;
+    let parent = compositor.create_surface(&qh, ());
+    jfn_wlproxy::jfn_wlproxy_set_host_surface(parent.id().protocol_id());
 
     let state = WlState {
         conn,
@@ -317,6 +308,8 @@ pub(crate) unsafe fn init(
         display_ptr: NonNull::new(display_ptr).ok_or_else(|| "display_ptr is null".to_string())?,
         gpu_ctx: None,
         use_gpu_paint: false,
+        scene: crate::scene::Scene::default(),
+        menu_io: crate::popup::MenuIo::default(),
     };
 
     STATE

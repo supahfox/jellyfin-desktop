@@ -16,7 +16,9 @@ use std::sync::OnceLock;
 
 pub mod geometry;
 
-pub use geometry::{SurfaceSize, WindowGeometry, WindowPos};
+pub use geometry::{
+    BootGeometry, LogicalSize, PhysicalSize, Scale, SurfaceSize, WindowGeometry, WindowPos,
+};
 
 // =====================================================================
 // Main-thread park (non-macOS default for run_main_loop/wake_main_loop)
@@ -218,9 +220,25 @@ pub struct JfnPopupRequest {
     pub options: Vec<String>,
     pub initial_highlight: c_int,
     /// Fires on the platform backend's thread when the user picks an
-    /// option (or `-1` for cancel). Native-menu backends (macOS) call
-    /// it; compositor backends (Wayland / X11 / Windows) drop the
-    /// closure without firing — CEF dispatches selection itself.
+    /// option (or `-1` for cancel). Native-menu backends (macOS / Wayland)
+    /// call it; compositor-rendered backends (X11 / Windows) drop the closure
+    /// without firing — CEF dispatches selection itself.
+    pub on_selected: Option<Box<dyn FnOnce(c_int) + Send>>,
+}
+
+pub struct JfnMenuItem {
+    pub id: c_int,
+    pub label: String,
+    pub enabled: bool,
+    pub separator: bool,
+}
+
+pub struct JfnContextMenuRequest {
+    /// Logical (CEF view) coordinates of the click, not physical pixels.
+    pub x: c_int,
+    pub y: c_int,
+    pub items: Vec<JfnMenuItem>,
+    /// Called with the chosen item id, or `-1` when the menu is dismissed.
     pub on_selected: Option<Box<dyn FnOnce(c_int) + Send>>,
 }
 
@@ -290,6 +308,8 @@ pub trait Platform: Send + Sync {
 
     // Popup
     fn popup_show(&self, _s: SurfaceHandle, _req: JfnPopupRequest) {}
+
+    fn context_menu_show(&self, _s: SurfaceHandle, _req: JfnContextMenuRequest) {}
     fn popup_hide(&self, _s: SurfaceHandle) {}
     fn popup_present(&self, _s: SurfaceHandle, _info: *const c_void, _lw: c_int, _lh: c_int) {}
     fn popup_present_software(
@@ -333,6 +353,11 @@ pub trait Platform: Send + Sync {
     fn get_display_scale(&self, _x: c_int, _y: c_int) -> f32 {
         1.0
     }
+
+    /// Seed the window owner with the restored boot geometry. Backends that
+    /// own their toplevel (Wayland) size it here; mpv-backed backends rely on
+    /// mpv's `--geometry` instead and keep the no-op default.
+    fn apply_boot_geometry(&self, _g: &BootGeometry) {}
 
     /// Current window position, or `None` if it can't be determined.
     fn query_window_position(&self) -> Option<WindowPos> {

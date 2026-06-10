@@ -29,9 +29,17 @@ use jfn_input::buttons::{
 };
 use jfn_platform_abi::event_flags::{
     EVENTFLAG_LEFT_MOUSE_BUTTON, EVENTFLAG_MIDDLE_MOUSE_BUTTON, EVENTFLAG_RIGHT_MOUSE_BUTTON,
+    EVENTFLAG_SHIFT_DOWN,
 };
 
 use jfn_platform_abi::cursor::CursorShape;
+
+const XK_MENU: u32 = 0xff67;
+const XK_F10: u32 = 0xffc7;
+
+fn is_context_menu_key(sym: u32, mods: u32) -> bool {
+    sym == XK_MENU || (sym == XK_F10 && mods & EVENTFLAG_SHIFT_DOWN != 0)
+}
 
 fn cef_to_wl_shape(shape: CursorShape) -> u32 {
     use CursorShape::*;
@@ -115,8 +123,17 @@ struct State {
     // Pointer state.
     ptr_x: f64,
     ptr_y: f64,
+    // Last pointer position on the MAIN surface. ptr_x/ptr_y rebase to
+    // menu-local coords while the pointer is over the popup; events forwarded
+    // to CEF during that window must use these instead.
+    main_ptr_x: f64,
+    main_ptr_y: f64,
     pointer_serial: u32,
     mouse_button_modifiers: u32,
+    // Releases for button presses consumed by our native popup must also be
+    // consumed, even if the popup closes on the press and is inactive by the
+    // time Wayland delivers the matching release.
+    popup_swallowed_buttons: u32,
 
     // Scroll accumulation across a single pointer frame.
     scroll_dx: f64,
@@ -133,11 +150,22 @@ struct State {
 
     // Latest desired cursor (re-applied on pointer enter).
     cursor_type: Arc<AtomicU32>,
+
+    menu_focus: bool,
 }
 
 impl State {
     fn cef_modifiers(&self) -> u32 {
         self.modifiers | self.mouse_button_modifiers
+    }
+
+    fn mouse_button_flag(button: u32) -> Option<u32> {
+        match button {
+            BTN_LEFT => Some(EVENTFLAG_LEFT_MOUSE_BUTTON),
+            BTN_RIGHT => Some(EVENTFLAG_RIGHT_MOUSE_BUTTON),
+            BTN_MIDDLE => Some(EVENTFLAG_MIDDLE_MOUSE_BUTTON),
+            _ => None,
+        }
     }
 
     fn refresh_modifiers(&mut self) {
@@ -221,14 +249,21 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
         match event {
             Event::Enter {
                 serial,
+                surface,
                 surface_x,
                 surface_y,
-                ..
             } => {
                 state.pointer_serial = serial;
-                state.apply_cursor(qh);
+                state.menu_focus = crate::popup::surface_matches(surface.id().protocol_id());
                 state.ptr_x = surface_x;
                 state.ptr_y = surface_y;
+                if state.menu_focus {
+                    crate::popup::handle_motion(surface_x as i32, surface_y as i32);
+                    return;
+                }
+                state.main_ptr_x = surface_x;
+                state.main_ptr_y = surface_y;
+                state.apply_cursor(qh);
                 if let Some(f) = state.cb.mouse_move {
                     f(
                         state.ptr_x as i32,
@@ -239,6 +274,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 }
             }
             Event::Leave { .. } => {
+                if state.menu_focus {
+                    state.menu_focus = false;
+                    return;
+                }
                 if let Some(f) = state.cb.mouse_move {
                     f(
                         state.ptr_x as i32,
@@ -255,6 +294,16 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
             } => {
                 state.ptr_x = surface_x;
                 state.ptr_y = surface_y;
+                if !state.menu_focus {
+                    state.main_ptr_x = surface_x;
+                    state.main_ptr_y = surface_y;
+                }
+                if crate::popup::active() {
+                    if state.menu_focus {
+                        crate::popup::handle_motion(surface_x as i32, surface_y as i32);
+                    }
+                    return;
+                }
                 if let Some(f) = state.cb.mouse_move {
                     f(
                         state.ptr_x as i32,
@@ -268,6 +317,53 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 button, state: bs, ..
             } => {
                 let pressed = matches!(bs, WEnum::Value(wl_pointer::ButtonState::Pressed));
+                let flag = Self::mouse_button_flag(button);
+                if crate::popup::active() {
+                    if pressed {
+                        if let Some(flag) = flag {
+                            state.popup_swallowed_buttons |= flag;
+                        }
+                        if state.menu_focus {
+                            crate::popup::handle_button(
+                                state.ptr_x as i32,
+                                state.ptr_y as i32,
+                                pressed,
+                            );
+                        } else {
+                            // Click on our own window outside the menu: the popup grab
+                            // won't dismiss same-client clicks, so do it ourselves.
+                            crate::popup::handle_outside_press();
+                        }
+                    } else if let Some(flag) = flag {
+                        if state.mouse_button_modifiers & flag != 0 {
+                            // This is the release for the click that opened the
+                            // popup. CEF saw that press before the native menu
+                            // became active, so it must also see the matching
+                            // release; otherwise Blink keeps the button latched
+                            // and subsequent <select> activations are ignored.
+                            state.mouse_button_modifiers &= !flag;
+                            if let Some(f) = state.cb.mouse_button {
+                                f(
+                                    button,
+                                    0,
+                                    state.main_ptr_x as i32,
+                                    state.main_ptr_y as i32,
+                                    state.cef_modifiers(),
+                                );
+                            }
+                        } else {
+                            state.popup_swallowed_buttons &= !flag;
+                        }
+                    }
+                    return;
+                }
+                if let Some(flag) = flag
+                    && !pressed
+                    && state.popup_swallowed_buttons & flag != 0
+                {
+                    state.popup_swallowed_buttons &= !flag;
+                    return;
+                }
                 if button == BTN_SIDE
                     || button == BTN_EXTRA
                     || button == BTN_BACK
@@ -281,12 +377,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     }
                     return;
                 }
-                let flag = match button {
-                    BTN_LEFT => EVENTFLAG_LEFT_MOUSE_BUTTON,
-                    BTN_RIGHT => EVENTFLAG_RIGHT_MOUSE_BUTTON,
-                    BTN_MIDDLE => EVENTFLAG_MIDDLE_MOUSE_BUTTON,
-                    _ => return,
-                };
+                let Some(flag) = flag else { return };
+                // Grab must be requested now, while this press's implicit grab is
+                // live; the menu model only arrives later via CEF's async callback.
+                // Right-click arms the context menu; left-click arms a possible
+                // `<select>` dropdown (CEF tells us asynchronously if one opened).
+                if (button == BTN_RIGHT || button == BTN_LEFT) && pressed {
+                    crate::popup::arm(state.ptr_x as i32, state.ptr_y as i32);
+                }
                 if pressed {
                     state.mouse_button_modifiers |= flag;
                 } else {
@@ -348,6 +446,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 if dx == 0 && dy == 0 {
                     return;
                 }
+                if crate::popup::active() {
+                    // Wheel must not reach CEF while a <select> popup is open —
+                    // a wheel event outside Blink's popup rect cancels its
+                    // widget out from under the native menu.
+                    if state.menu_focus {
+                        crate::popup::handle_scroll(dy);
+                    }
+                    return;
+                }
                 if let Some(f) = state.cb.scroll {
                     f(
                         state.ptr_x as i32,
@@ -400,12 +507,26 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     state.xkb_st = Some(st);
                 }
             }
-            Event::Enter { .. } => {
+            Event::Enter { surface, .. } => {
+                // Menu-surface enter/leave is grab plumbing, not CEF focus.
+                if crate::popup::is_menu_surface(surface.id().protocol_id()) {
+                    return;
+                }
                 if let Some(f) = state.cb.kb_focus {
                     f(1);
                 }
             }
-            Event::Leave { .. } => {
+            Event::Leave { surface, .. } => {
+                // Neither leave may reach CEF as focus-loss — Blink would
+                // close the <select> popup the replayed selection keys still
+                // need: leave of the menu surface (popup teardown), and leave
+                // of the main surface caused by our own grab activating.
+                if crate::popup::is_menu_surface(surface.id().protocol_id()) {
+                    return;
+                }
+                if crate::popup::is_engaged() {
+                    return;
+                }
                 if let Some(f) = state.cb.kb_focus {
                     f(0);
                 }
@@ -415,6 +536,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 let kc: xkb::Keycode = (key + 8).into();
                 let sym = st.key_get_one_sym(kc);
                 let pressed = matches!(ks, WEnum::Value(wl_keyboard::KeyState::Pressed));
+                if crate::popup::active() {
+                    crate::popup::handle_key(sym.into(), pressed);
+                    return;
+                }
+                if pressed && is_context_menu_key(sym.into(), state.modifiers) {
+                    crate::popup::arm(state.ptr_x as i32, state.ptr_y as i32);
+                }
                 if let Some(f) = state.cb.key {
                     f(
                         sym.into(),
@@ -591,6 +719,8 @@ fn init_impl(display: *mut c_void, cb: Callbacks) -> Option<JfnInputWayland> {
     let qh = queue.handle();
 
     let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=8, ()).ok()?;
+    // Register before the bind is flushed so the proxy claims this seat (see wlproxy).
+    jfn_wlproxy::jfn_wlproxy_set_input_seat(seat.id().protocol_id());
     let cursor_mgr: Option<WpCursorShapeManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
 
     let cursor_type = Arc::new(AtomicU32::new(CursorShape::Pointer.as_raw() as u32));
@@ -605,8 +735,11 @@ fn init_impl(display: *mut c_void, cb: Callbacks) -> Option<JfnInputWayland> {
         cursor_dev: None,
         ptr_x: 0.0,
         ptr_y: 0.0,
+        main_ptr_x: 0.0,
+        main_ptr_y: 0.0,
         pointer_serial: 0,
         mouse_button_modifiers: 0,
+        popup_swallowed_buttons: 0,
         scroll_dx: 0.0,
         scroll_dy: 0.0,
         scroll_v120_x: 0,
@@ -617,6 +750,7 @@ fn init_impl(display: *mut c_void, cb: Callbacks) -> Option<JfnInputWayland> {
         xkb_st: None,
         modifiers: 0,
         cursor_type: cursor_type.clone(),
+        menu_focus: false,
     };
 
     let stop = Arc::new(AtomicBool::new(false));
