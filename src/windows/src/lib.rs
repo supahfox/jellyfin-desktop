@@ -9,15 +9,17 @@ use std::sync::atomic::Ordering;
 pub use jfn_platform_abi::{DisplayBackend, JfnPopupRequest, JfnRect, Platform, WindowDecorations};
 
 mod compositor;
+mod dropdown;
 mod input;
+mod mpv_host;
 mod platform;
+mod process;
 pub use compositor::{
     jfn_win_begin_transition_locked, jfn_win_cleanup_compositor, jfn_win_init_compositor,
     jfn_win_update_surface_size, jfn_win_wndproc_begin_transition_locked,
     jfn_win_wndproc_end_transition_locked, win_alloc_surface, win_end_transition, win_free_surface,
-    win_popup_hide, win_popup_present, win_popup_present_software, win_popup_show, win_restack,
-    win_set_expected_size, win_surface_present, win_surface_present_software, win_surface_resize,
-    win_surface_set_visible,
+    win_restack, win_set_expected_size, win_surface_present, win_surface_present_software,
+    win_surface_resize, win_surface_set_visible,
 };
 pub use input::{
     jfn_input_windows_resize_to_parent, jfn_input_windows_run_input_thread,
@@ -310,6 +312,19 @@ pub fn win_open_external_url(url: &str) {
 
 use jfn_platform_abi::{IdleInhibitLevel, SurfaceHandle, SurfaceSize, WindowGeometry, WindowPos};
 
+/// SMTC-backed [`jfn_platform_abi::MediaSink`].
+struct SmtcSink;
+
+impl jfn_platform_abi::MediaSink for SmtcSink {
+    fn start(&self) {
+        jfn_windows_sink::jfn_windows_sink_start();
+    }
+
+    fn stop(&self) {
+        jfn_windows_sink::jfn_windows_sink_stop();
+    }
+}
+
 pub struct WindowsPlatform;
 
 impl Platform for WindowsPlatform {
@@ -374,29 +389,33 @@ impl Platform for WindowsPlatform {
         win_restack(ordered.as_ptr(), ordered.len());
     }
 
-    fn popup_show(&self, s: SurfaceHandle, req: JfnPopupRequest) {
-        win_popup_show(s, req.x, req.y);
-        // CEF dispatches selection itself on Windows; drop the closure.
+    fn dropdown_backend(&self) -> &'static dyn jfn_platform_abi::DropdownBackend {
+        &dropdown::CompositorDropdown
     }
 
-    fn popup_hide(&self, s: SurfaceHandle) {
-        win_popup_hide(s);
+    fn context_menu_backend(&self) -> &'static dyn jfn_platform_abi::ContextMenuBackend {
+        &jfn_platform_abi::JsMenuContextMenu
     }
 
-    fn popup_present(&self, s: SurfaceHandle, info: *const c_void, lw: c_int, lh: c_int) {
-        win_popup_present(s, info, lw, lh);
+    fn mpv_host(&self) -> &dyn jfn_platform_abi::MpvHost {
+        &mpv_host::WindowsMpvHost
     }
 
-    fn popup_present_software(
-        &self,
-        s: SurfaceHandle,
-        buffer: *const c_void,
-        pw: c_int,
-        ph: c_int,
-        lw: c_int,
-        lh: c_int,
-    ) {
-        win_popup_present_software(s, buffer, pw, ph, lw, lh);
+    fn media_session(&self) -> &dyn jfn_platform_abi::MediaSink {
+        &SmtcSink
+    }
+
+    fn cef_paths(&self) -> jfn_platform_abi::CefPaths {
+        let exe = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .unwrap_or_default();
+        let dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        jfn_platform_abi::CefPaths {
+            browser_subprocess_path: Some(exe),
+            resources_dir_path: Some(dir.clone()),
+            locales_dir_path: Some(dir.join("locales")),
+            ..Default::default()
+        }
     }
 
     fn set_fullscreen(&self, v: bool) {
@@ -468,6 +487,36 @@ impl Platform for WindowsPlatform {
 
     fn open_external_url(&self, url: &str) {
         win_open_external_url(url);
+    }
+
+    fn open_path(&self, path: &std::path::Path) {
+        // explorer.exe wants native backslash-separated paths.
+        let native: String = path
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c == '/' { '\\' } else { c })
+            .collect();
+        let _ = std::process::Command::new("explorer").arg(native).spawn();
+    }
+
+    fn install_shutdown_handler(&self, on_shutdown: fn()) {
+        process::install_shutdown(on_shutdown);
+    }
+
+    fn single_instance_try_signal(&self, instance_id: &str) -> bool {
+        process::try_signal_existing(instance_id)
+    }
+
+    fn single_instance_start_listener(
+        &self,
+        instance_id: &str,
+        cb: jfn_platform_abi::Callback,
+    ) -> bool {
+        process::start_listener(instance_id, cb)
+    }
+
+    fn single_instance_stop(&self, instance_id: &str) {
+        process::stop_listener(instance_id);
     }
 }
 

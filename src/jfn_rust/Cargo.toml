@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [features]
 default = ["kde-palette"]
-kde-palette = ["jfn-cef/kde-palette", "jfn-wayland/kde-palette"]
+kde-palette = ["jfn-wayland/kde-palette"]
 
 [dependencies]
 tracing.workspace = true
@@ -31,25 +31,16 @@ jfn-logging = { path = "../logging" }
 jfn-mpv = { path = "../mpv" }
 jfn-paths = { path = "../paths" }
 jfn-playback = { path = "../playback" }
+jfn-wake-event = { path = "../wake_event" }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 jfn-macos = { path = "../macos" }
-jfn-macos-sink = { path = "../macos_sink" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 jfn-windows = { path = "../windows" }
-jfn-windows-sink = { path = "../windows_sink" }
-windows-sys = { workspace = true, features = [
-    "Win32_System_Threading",
-    "Win32_System_Pipes",
-    "Win32_System_IO",
-    "Win32_Storage_FileSystem",
-    "Win32_Foundation",
-    "Win32_Security",
-] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 embed-resource = "3"

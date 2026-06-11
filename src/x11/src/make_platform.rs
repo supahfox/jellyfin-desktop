@@ -170,27 +170,24 @@ impl Platform for X11Platform {
         };
     }
 
-    fn popup_show(&self, _s: SurfaceHandle, _req: JfnPopupRequest) {
-        // CEF dispatches <select> selection itself on X11; drop the closure.
+    fn dropdown_backend(&self) -> &'static dyn jfn_platform_abi::DropdownBackend {
+        &jfn_platform_abi::JsMenuDropdown
     }
 
-    fn context_menu_show(&self, _s: SurfaceHandle, req: JfnContextMenuRequest) {
-        let items = req
-            .items
-            .into_iter()
-            .map(|i| crate::menu::MenuItem {
-                id: i.id,
-                label: i.label,
-                enabled: i.enabled,
-                separator: i.separator,
-            })
-            .collect();
-        crate::menu::show(crate::menu::MenuRequest {
-            x: req.x,
-            y: req.y,
-            items,
-            on_selected: req.on_selected,
-        });
+    fn context_menu_backend(&self) -> &'static dyn jfn_platform_abi::ContextMenuBackend {
+        crate::context_menu::backend()
+    }
+
+    fn media_session(&self) -> &dyn jfn_platform_abi::MediaSink {
+        &jfn_mpris::MprisSink
+    }
+
+    fn cef_paths(&self) -> jfn_platform_abi::CefPaths {
+        jfn_linux_util::cef_paths()
+    }
+
+    fn window_decorations_supported(&self) -> bool {
+        true
     }
 
     fn begin_transition(&self) {
@@ -307,6 +304,10 @@ impl Platform for X11Platform {
 
     fn open_external_url(&self, url: &str) {
         jfn_linux_util::open_url::open(url);
+    }
+
+    fn open_path(&self, path: &std::path::Path) {
+        jfn_linux_util::open_url::open(&path.to_string_lossy());
     }
 }
 

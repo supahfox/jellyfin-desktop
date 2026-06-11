@@ -11,7 +11,9 @@ use cef::{
     CefString, CefStringUserfreeUtf16, DictionaryValue, ImplDictionaryValue, ImplListValue,
     dictionary_value_create, list_value_create, sys,
 };
-use jfn_platform_abi::{DisplayBackend, WindowDecorations};
+use jfn_platform_abi::{
+    ContextMenuBackend, ContextMenuScript, DropdownBackend, DropdownScript, WindowDecorations,
+};
 use std::os::raw::c_char;
 use std::sync::OnceLock;
 
@@ -209,6 +211,18 @@ impl InjectedScript {
             Self::SelectMenu => "select-menu.js",
         }
     }
+
+    fn from_dropdown(script: DropdownScript) -> Self {
+        match script {
+            DropdownScript::SelectMenu => Self::SelectMenu,
+        }
+    }
+
+    fn from_context_menu(script: ContextMenuScript) -> Self {
+        match script {
+            ContextMenuScript::ContextMenu => Self::ContextMenu,
+        }
+    }
 }
 
 const WEB_FUNCTIONS: &[NativeFunction] = &[
@@ -252,7 +266,6 @@ const WEB_SCRIPTS: &[InjectedScript] = &[
     InjectedScript::InputPlugin,
     InjectedScript::ClientSettings,
 ];
-
 const OVERLAY_FUNCTIONS: &[NativeFunction] = &[
     NativeFunction::GetSavedServerUrl,
     NativeFunction::SaveServerUrl,
@@ -279,6 +292,8 @@ const SCRIPTS_KEY: &str = "scripts";
 const DEVICE_PROFILE_JSON_KEY: &str = "device_profile_json";
 const SHARED_TEXTURES_ENABLED_KEY: &str = "shared_textures_enabled";
 const WINDOW_DECORATIONS_KEY: &str = "window_decorations";
+const WINDOW_DECORATIONS_SUPPORTED_KEY: &str = "window_decorations_supported";
+const THEME_COLOR_SUPPORTED_KEY: &str = "theme_color_supported";
 
 static DEVICE_PROFILE_JSON: OnceLock<String> = OnceLock::new();
 
@@ -289,6 +304,8 @@ pub(crate) struct ExtraInfo {
     device_profile_json: Option<String>,
     shared_textures_enabled: bool,
     window_decorations: Option<WindowDecorations>,
+    window_decorations_supported: bool,
+    theme_color_supported: bool,
 }
 
 impl ExtraInfo {
@@ -301,6 +318,8 @@ impl ExtraInfo {
             window_decorations: read_string(&dict, WINDOW_DECORATIONS_KEY)
                 .as_deref()
                 .and_then(WindowDecorations::parse),
+            window_decorations_supported: read_bool(&dict, WINDOW_DECORATIONS_SUPPORTED_KEY),
+            theme_color_supported: read_bool(&dict, THEME_COLOR_SUPPORTED_KEY),
         }
     }
 
@@ -311,6 +330,18 @@ impl ExtraInfo {
         dict.set_bool(
             Some(&CefString::from(SHARED_TEXTURES_ENABLED_KEY)),
             if self.shared_textures_enabled { 1 } else { 0 },
+        );
+        dict.set_bool(
+            Some(&CefString::from(WINDOW_DECORATIONS_SUPPORTED_KEY)),
+            if self.window_decorations_supported {
+                1
+            } else {
+                0
+            },
+        );
+        dict.set_bool(
+            Some(&CefString::from(THEME_COLOR_SUPPORTED_KEY)),
+            if self.theme_color_supported { 1 } else { 0 },
         );
         if let Some(json) = self.device_profile_json {
             dict.set_string(
@@ -345,6 +376,14 @@ impl ExtraInfo {
 
     pub(crate) fn window_decorations(&self) -> Option<&'static str> {
         self.window_decorations.map(WindowDecorations::as_str)
+    }
+
+    pub(crate) fn window_decorations_supported(&self) -> bool {
+        self.window_decorations_supported
+    }
+
+    pub(crate) fn theme_color_supported(&self) -> bool {
+        self.theme_color_supported
     }
 }
 
@@ -445,6 +484,7 @@ fn build_extra_info(
     add_ctx_menu: bool,
     add_window: bool,
     shared_textures_enabled: bool,
+    ctx_menu: &'static dyn ContextMenuBackend,
 ) -> ExtraInfo {
     let mut functions = functions.to_vec();
     if add_window {
@@ -462,7 +502,13 @@ fn build_extra_info(
         scripts.push(InjectedScript::Csd);
     }
     if add_ctx_menu {
-        scripts.push(InjectedScript::ContextMenu);
+        scripts.extend(
+            ctx_menu
+                .scripts()
+                .iter()
+                .copied()
+                .map(InjectedScript::from_context_menu),
+        );
     }
 
     ExtraInfo {
@@ -471,6 +517,8 @@ fn build_extra_info(
         device_profile_json: None,
         shared_textures_enabled,
         window_decorations: None,
+        window_decorations_supported: false,
+        theme_color_supported: false,
     }
 }
 
@@ -478,6 +526,8 @@ pub(crate) fn build_for_kind(
     kind: &str,
     add_ctx_menu: bool,
     shared_textures_enabled: bool,
+    dropdown: &'static dyn DropdownBackend,
+    ctx_menu: &'static dyn ContextMenuBackend,
 ) -> Option<ExtraInfo> {
     match kind {
         "web" => {
@@ -487,6 +537,7 @@ pub(crate) fn build_for_kind(
                 add_ctx_menu,
                 true,
                 shared_textures_enabled,
+                ctx_menu,
             );
             if let Some(json) = DEVICE_PROFILE_JSON.get()
                 && !json.is_empty()
@@ -494,9 +545,19 @@ pub(crate) fn build_for_kind(
                 extra_info.device_profile_json = Some(json.clone());
             }
             extra_info.window_decorations = Some(jfn_config::window_decorations_mode());
-            if jfn_platform_abi::get().display() == DisplayBackend::X11 {
-                extra_info.scripts.push(InjectedScript::SelectMenu);
+            // Resolved here, browser-side: the renderer process never has a
+            // Platform installed on Linux.
+            if let Some(p) = jfn_platform_abi::try_get() {
+                extra_info.window_decorations_supported = p.window_decorations_supported();
+                extra_info.theme_color_supported = p.theme_color_supported();
             }
+            extra_info.scripts.extend(
+                dropdown
+                    .scripts()
+                    .iter()
+                    .copied()
+                    .map(InjectedScript::from_dropdown),
+            );
             Some(extra_info)
         }
         "overlay" => Some(build_extra_info(
@@ -505,6 +566,7 @@ pub(crate) fn build_for_kind(
             add_ctx_menu,
             true,
             shared_textures_enabled,
+            ctx_menu,
         )),
         "about" => Some(build_extra_info(
             ABOUT_FUNCTIONS,
@@ -512,6 +574,7 @@ pub(crate) fn build_for_kind(
             add_ctx_menu,
             true,
             shared_textures_enabled,
+            ctx_menu,
         )),
         _ => None,
     }
