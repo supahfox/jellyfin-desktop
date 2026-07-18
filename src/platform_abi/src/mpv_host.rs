@@ -21,6 +21,15 @@ pub trait MpvHost: Send + Sync {
         true
     }
 
+    /// The host's authoritative maximized state, or `None` when mpv — not the
+    /// host — owns it; core then resolves `None` against mpv's `window-maximized`
+    /// property. A host that owns its own toplevel (Wayland) returns `Some`.
+    fn window_maximized(&self) -> Option<bool> {
+        None
+    }
+
+    fn ensure_host_window(&self) {}
+
     /// Own the VO wait loop. `pump(may_block)` drains queued mpv events
     /// (and, when `may_block`, may additionally wait for the next one);
     /// it returns `false` once waiting is over. Platforms that must keep

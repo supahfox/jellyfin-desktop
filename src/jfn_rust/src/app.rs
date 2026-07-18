@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use clap::Parser;
 use jfn_cef::{APP_CEF_VERSION, APP_VERSION_FULL};
-use jfn_platform_abi::{IdleInhibitLevel, LogicalSize, Platform, Scale, WindowGeometry};
+use jfn_platform_abi::{IdleInhibitLevel, LogicalSize, Platform, WindowGeometry};
 
 use crate::cli;
 
@@ -53,7 +53,7 @@ fn normalize_passthrough(s: &str) -> String {
 
 fn print_version() {
     println!(
-        "jellyfin-desktop {}\n\nCEF {}\n",
+        "jellium-desktop {}\n\nCEF {}\n",
         APP_VERSION_FULL, APP_CEF_VERSION
     );
     use std::io::Write;
@@ -75,7 +75,7 @@ fn init_logging(log_file: Option<String>, log_level: &str) {
     };
     jfn_logging::jfn_log_init(&log_path, &filter);
 
-    tracing::info!(target: "Main", "jellyfin-desktop {APP_VERSION_FULL}");
+    tracing::info!(target: "Main", "jellium-desktop {APP_VERSION_FULL}");
     tracing::info!(target: "Main", "CEF {APP_CEF_VERSION}");
     if !log_path.is_empty() {
         tracing::info!(target: "Main", "Log file: {log_path}");
@@ -213,7 +213,7 @@ fn resolve_startup_options(cli: &cli::Cli) -> StartupOptions {
 
 struct MpvInitOptions<'a> {
     backend_byte: u8,
-    boot_geometry: &'a str,
+    boot_geometry: Option<&'a str>,
     boot_force_position: bool,
     boot_window_max: bool,
     hwdec: &'a str,
@@ -224,9 +224,9 @@ struct MpvInitOptions<'a> {
 }
 
 fn init_mpv_handle(opts: MpvInitOptions<'_>) -> *mut jfn_mpv::sys::mpv_handle {
-    let geometry_c = cs(opts.boot_geometry);
+    let geometry_c = opts.boot_geometry.map(cs);
     let hwdec_c = cs(opts.hwdec);
-    let user_agent_c = cs(&format!("JellyfinDesktop/{}", APP_VERSION_FULL));
+    let user_agent_c = cs(&format!("JelliumDesktop/{}", APP_VERSION_FULL));
     let passthrough_c = cs(opts.audio_passthrough);
     let channels_c = cs(opts.audio_channels);
     let mpv_log_level_c = cs(opts.mpv_log_level);
@@ -245,7 +245,7 @@ fn init_mpv_handle(opts: MpvInitOptions<'_>) -> *mut jfn_mpv::sys::mpv_handle {
         } else {
             channels_c.as_ptr()
         },
-        geometry: geometry_c.as_ptr(),
+        geometry: geometry_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
         force_window_position: opts.boot_force_position,
         window_maximized_at_boot: opts.boot_window_max,
         mpv_log_level: mpv_log_level_c.as_ptr(),
@@ -289,11 +289,11 @@ fn wait_for_vo_window() -> Option<(i32, i32)> {
                     return false;
                 }
                 jfn_mpv::api::WaitEvent::Event(event) => {
-                    consume_vo_event(&event, &mut mw, &mut mh, &mut need_max);
+                    consume_vo_event(&event, &mut mw, &mut mh);
                 }
             }
         }
-        if vo_ready(&mut mw, &mut mh, &need_max) {
+        if vo_ready(&mut mw, &mut mh, &mut need_max) {
             return false;
         }
         if may_block {
@@ -307,7 +307,7 @@ fn wait_for_vo_window() -> Option<(i32, i32)> {
                     return false;
                 }
                 jfn_mpv::api::WaitEvent::Event(event) => {
-                    consume_vo_event(&event, &mut mw, &mut mh, &mut need_max);
+                    consume_vo_event(&event, &mut mw, &mut mh);
                 }
             }
         }
@@ -338,7 +338,7 @@ fn publish_device_profile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) {
     let profile = jfn_jellyfin::build_device_profile(
         &decoders,
         &caps.demuxers,
-        "Jellyfin Desktop",
+        "Jellium Desktop",
         APP_VERSION_FULL,
         force,
     );
@@ -416,8 +416,8 @@ fn shutdown_runtime(manager_thread: std::thread::JoinHandle<()>) {
     // Join before any teardown so no posted task outlives the layer free below.
     let _ = manager_thread.join();
 
-    // Sever host↔mpv links (e.g. wlproxy→host callbacks) that could
-    // deadlock the teardown below once CEF threads start dying.
+    // Sever host↔mpv links that could deadlock the teardown below once
+    // CEF threads start dying.
     plat().mpv_host().detach();
 
     jfn_color::theme::jfn_theme_color_shutdown();
@@ -480,21 +480,19 @@ fn sync_cef_window_metrics(
 
     let saved = jfn_config::window_geometry();
     let locked = fs_flag != 0 || jfn_playback::ingest_driver::jfn_playback_window_maximized();
-    if !locked
-        && display_hidpi_scale > 0.0
-        && saved.scale > 0.0
-        && (display_hidpi_scale - saved.scale as f64).abs() >= 0.01
-    {
-        let physical = LogicalSize {
+    if let Some(physical) = plat().reconcile_mpv_size(
+        display_hidpi_scale,
+        saved.scale,
+        LogicalSize {
             w: saved.logical_width,
             h: saved.logical_height,
-        }
-        .to_physical(Scale(display_hidpi_scale as f32));
+        },
+        locked,
+    ) {
         let clamped = plat().clamp_window_geometry(WindowGeometry {
             w: physical.w,
             h: physical.h,
-            x: -1,
-            y: -1,
+            position: None,
         });
         let (new_pw, new_ph) = (clamped.w, clamped.h);
         let geom_str = format!("{new_pw}x{new_ph}");
@@ -614,11 +612,12 @@ pub fn jfn_app_main() -> c_int {
     // mpv's --geometry takes physical pixels (see m_geometry_apply in
     // third_party/mpv/options/m_option.c).
     let backend_byte: u8 = plat().display() as u8;
+    let boot_mpv_geometry = plat().boot_mpv_geometry(&boot);
     let raw = init_mpv_handle(MpvInitOptions {
         backend_byte,
-        boot_geometry: &boot.mpv_geometry_string(),
+        boot_geometry: boot_mpv_geometry.as_deref(),
         boot_force_position: boot.force_position(),
-        boot_window_max: boot.maximized,
+        boot_window_max: boot.maximized(),
         hwdec: &opts.hwdec,
         audio_passthrough: &opts.audio_passthrough,
         audio_exclusive: opts.audio_exclusive,
@@ -651,6 +650,8 @@ pub fn jfn_app_main() -> c_int {
     // input-default-bindings=no drops the builtin CLOSE_WIN -> quit binding;
     // the WM close button needs it back.
     install_mpv_close_binding(raw);
+
+    plat().mpv_host().ensure_host_window();
 
     let Some((mw, mh)) = wait_for_vo_window() else {
         return 0;
@@ -723,16 +724,15 @@ fn mpv_log_level_from_filter() -> &'static str {
     }
 }
 
-const JFN_OBSERVE_WINDOW_MAX: u64 = 11;
-
 fn boot_window_size() -> Option<(i32, i32)> {
     crate::window_geometry::controller()
         .source()
-        .size()
-        .map(|s| (s.w, s.h))
+        .snapshot()
+        .extent
+        .map(|e| (e.physical().w, e.physical().h))
 }
 
-fn consume_vo_event(event: &jfn_mpv::Event, mw: &mut i32, mh: &mut i32, need_max: &mut bool) {
+fn consume_vo_event(event: &jfn_mpv::Event, mw: &mut i32, mh: &mut i32) {
     let scale_raw = plat().get_scale();
     let scale = if scale_raw > 0.0 { scale_raw } else { 1.0 };
     jfn_playback::ingest_driver::jfn_playback_ingest_mpv_event_owned(
@@ -740,22 +740,23 @@ fn consume_vo_event(event: &jfn_mpv::Event, mw: &mut i32, mh: &mut i32, need_max
         scale,
         plat().mpv_host().logical_content_size(),
     );
-    if let jfn_mpv::Event::PropertyChange { id, .. } = event
-        && *id == JFN_OBSERVE_WINDOW_MAX
-        && jfn_playback::ingest_driver::jfn_playback_window_maximized()
-    {
-        *need_max = false;
-    }
     if let Some((w, h)) = boot_window_size() {
         *mw = w;
         *mh = h;
     }
 }
 
-fn vo_ready(mw: &mut i32, mh: &mut i32, need_max: &bool) -> bool {
+fn vo_ready(mw: &mut i32, mh: &mut i32, need_max: &mut bool) -> bool {
     if let Some((w, h)) = boot_window_size() {
         *mw = w;
         *mh = h;
+    }
+    let reported_max = plat()
+        .mpv_host()
+        .window_maximized()
+        .unwrap_or_else(jfn_playback::ingest_driver::jfn_playback_window_maximized);
+    if reported_max {
+        *need_max = false;
     }
     *mw > 0 && !*need_max && plat().mpv_host().host_ready()
 }
@@ -907,5 +908,5 @@ static CEF_INITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 static COORD_INITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // Single-instance listener is dropped via its OnceLock at process exit;
-// signal-disposition restore lives in `shutdown_signal`. wlproxy teardown
-// lives in the Wayland backend's `post_window_cleanup`.
+// signal-disposition restore lives in `shutdown_signal`. Wayland host
+// teardown lives in the backend's `post_window_cleanup`.

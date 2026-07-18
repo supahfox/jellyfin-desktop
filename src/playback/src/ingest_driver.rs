@@ -97,12 +97,12 @@ pub fn jfn_playback_set_window_pixels(pw: i32, ph: i32) {
     state().set_window_pixels(pw, ph);
 }
 
-pub fn jfn_playback_window_pw() -> i32 {
-    state().window_pw()
+pub fn jfn_playback_window_size() -> Option<(i32, i32)> {
+    positive_pair(state().window_pw(), state().window_ph())
 }
 
-pub fn jfn_playback_window_ph() -> i32 {
-    state().window_ph()
+fn positive_pair(w: i32, h: i32) -> Option<(i32, i32)> {
+    (w > 0 && h > 0).then_some((w, h))
 }
 
 /// Returns flag bits — see [`INGEST_FLAG_SHUTDOWN`].
@@ -121,7 +121,7 @@ pub fn jfn_playback_ingest_mpv_event_owned(
 
 /// Push synthetic OSD-dim pixels through the same digest path the
 /// `osd-dimensions` property observation drives. Used by the Wayland
-/// xdg_toplevel.configure intercept (`jfn_wayland::proxy::on_configure`)
+/// xdg_toplevel.configure intercept (`jfn_wayland::window_state::on_configure`)
 /// in place of mpv's own osd-dimensions delivery.
 pub fn jfn_playback_post_osd_pixels(
     pw: i32,
@@ -167,12 +167,8 @@ pub fn jfn_playback_window_maximized() -> bool {
     state().window_maximized()
 }
 
-pub fn jfn_playback_osd_pw() -> i32 {
-    state().osd_pw()
-}
-
-pub fn jfn_playback_osd_ph() -> i32 {
-    state().osd_ph()
+pub fn jfn_playback_osd_size() -> Option<(i32, i32)> {
+    positive_pair(state().osd_pw(), state().osd_ph())
 }
 
 pub fn jfn_playback_display_scale() -> f64 {
@@ -200,7 +196,7 @@ pub const BACKEND_WAYLAND: u8 = 0;
 
 /// Register the property observations whose IDs are dispatched by the
 /// ingest layer. Backend selection skips `osd-dimensions` on Wayland —
-/// the proxy's `xdg_toplevel.configure` intercept feeds those dims via
+/// the window's `xdg_toplevel.configure` feeds those dims via
 /// [`jfn_playback_post_osd_pixels`] instead, and observing it here would
 /// double-post identical values.
 ///

@@ -83,6 +83,12 @@ fn cef_to_wl_shape(shape: CursorShape) -> u32 {
     s as u32
 }
 
+static LAST_BUTTON_SERIAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn last_button_serial() -> u32 {
+    LAST_BUTTON_SERIAL.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub type MouseMoveFn = fn(x: i32, y: i32, mods: u32, leave: c_int);
 pub type MouseButtonFn = fn(button: u32, pressed: c_int, x: i32, y: i32, mods: u32);
 pub type ScrollFn = fn(x: i32, y: i32, dx: i32, dy: i32, mods: u32);
@@ -314,9 +320,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 }
             }
             Event::Button {
-                button, state: bs, ..
+                button,
+                state: bs,
+                serial,
+                ..
             } => {
                 let pressed = matches!(bs, WEnum::Value(wl_pointer::ButtonState::Pressed));
+                if pressed {
+                    LAST_BUTTON_SERIAL.store(serial, std::sync::atomic::Ordering::Release);
+                }
                 let flag = Self::mouse_button_flag(button);
                 if crate::popup::active() {
                     if pressed {
@@ -621,7 +633,7 @@ pub struct JfnInputWayland {
     cursor_type: Arc<AtomicU32>,
     set_cursor_inbox: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
-    wake_fd: c_int,
+    wake: Arc<jfn_wake_event::WakeEvent>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -629,12 +641,13 @@ fn worker_loop(
     conn: Connection,
     mut queue: wayland_client::EventQueue<State>,
     mut state: State,
-    wake_fd: c_int,
+    wake: Arc<jfn_wake_event::WakeEvent>,
     stop: Arc<AtomicBool>,
     cursor_type: Arc<AtomicU32>,
     set_cursor_inbox: Arc<AtomicBool>,
 ) {
     let display_fd = conn.as_fd().as_raw_fd();
+    let wake_fd = wake.fd();
     let qh = queue.handle();
     loop {
         // Apply any pending cursor change before we block.
@@ -687,14 +700,7 @@ fn worker_loop(
             break;
         }
         if pfds[1].revents & libc::POLLIN != 0 {
-            // Drain wake fd.
-            let mut buf = [0u8; 64];
-            loop {
-                let n = unsafe { libc::read(wake_fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-                if n <= 0 {
-                    break;
-                }
-            }
+            wake.drain();
             // Wake reasons: cursor change request, or cleanup.
             if stop.load(Ordering::Relaxed) {
                 let _ = queue.dispatch_pending(&mut state);
@@ -713,18 +719,13 @@ fn init_impl(display: *mut c_void, cb: Callbacks) -> Option<JfnInputWayland> {
     if display.is_null() {
         return None;
     }
-    let wake_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-    if wake_fd < 0 {
-        return None;
-    }
+    let wake = Arc::new(jfn_wake_event::WakeEvent::new()?);
     let backend = unsafe { Backend::from_foreign_display(display as *mut _) };
     let conn = Connection::from_backend(backend);
     let (globals, queue) = registry_queue_init::<State>(&conn).ok()?;
     let qh = queue.handle();
 
     let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=8, ()).ok()?;
-    // Register before the bind is flushed so the proxy claims this seat (see wlproxy).
-    jfn_wlproxy::jfn_wlproxy_set_input_seat(seat.id().protocol_id());
     let cursor_mgr: Option<WpCursorShapeManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
 
     let cursor_type = Arc::new(AtomicU32::new(CursorShape::Pointer.as_raw() as u32));
@@ -761,12 +762,13 @@ fn init_impl(display: *mut c_void, cb: Callbacks) -> Option<JfnInputWayland> {
     let cursor_type_thread = cursor_type.clone();
     let inbox_thread = set_cursor_inbox.clone();
     let stop_thread = stop.clone();
+    let wake_thread = wake.clone();
     let worker = thread::spawn(move || {
         worker_loop(
             conn,
             queue,
             state,
-            wake_fd,
+            wake_thread,
             stop_thread,
             cursor_type_thread,
             inbox_thread,
@@ -776,7 +778,7 @@ fn init_impl(display: *mut c_void, cb: Callbacks) -> Option<JfnInputWayland> {
         cursor_type,
         set_cursor_inbox,
         stop,
-        wake_fd,
+        wake,
         worker: Mutex::new(Some(worker)),
     })
 }
@@ -816,10 +818,7 @@ pub unsafe fn jfn_input_wayland_set_cursor(ctx: *mut JfnInputWayland, cef_cursor
     c.cursor_type.store(cef_cursor_type, Ordering::Relaxed);
     c.set_cursor_inbox.store(true, Ordering::Release);
     // Wake the input thread so it picks up the cursor change.
-    let v: u64 = 1;
-    unsafe {
-        libc::write(c.wake_fd, &v as *const u64 as *const c_void, 8);
-    }
+    c.wake.signal();
 }
 
 /// # Safety
@@ -831,12 +830,9 @@ pub unsafe fn jfn_input_wayland_cleanup(ctx: *mut JfnInputWayland) {
     }
     let mut boxed = unsafe { Box::from_raw(ctx) };
     boxed.stop.store(true, Ordering::Relaxed);
-    let v: u64 = 1;
-    unsafe {
-        libc::write(boxed.wake_fd, &v as *const u64 as *const c_void, 8);
-    }
+    boxed.wake.signal();
     if let Some(w) = boxed.worker.get_mut().take() {
         let _ = w.join();
     }
-    unsafe { libc::close(boxed.wake_fd) };
+    // The WakeEvent closes its fd when the last Arc (worker's + this one) drops.
 }
