@@ -190,6 +190,10 @@ impl Platform for X11Platform {
         true
     }
 
+    fn window_decoration_options(&self) -> jfn_platform_abi::DecorationOptions {
+        jfn_platform_abi::DecorationOptions::with_server(false)
+    }
+
     fn begin_transition(&self) {
         if let Some(m) = crate::x11_state::MUT.lock().as_mut() {
             m.gate.begin_capturing((m.pw, m.ph));
@@ -256,6 +260,10 @@ impl Platform for X11Platform {
 
     fn get_display_scale(&self, _x: c_int, _y: c_int) -> f32 {
         crate::scale::query_display_scale().unwrap_or(1.0)
+    }
+
+    fn window_source(&self) -> &'static dyn jfn_platform_abi::WindowSource {
+        &jfn_playback::window_source::MPV_WINDOW_SOURCE
     }
 
     fn query_window_position(&self) -> Option<WindowPos> {
