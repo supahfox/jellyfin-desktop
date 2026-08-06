@@ -8,29 +8,27 @@
 //! Each directory getter creates the directory (and parents) if missing
 //! before returning.
 
-use std::env;
+use parking_lot::{Mutex, MutexGuard};
 use std::fs;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 const APP_DIR_NAME: &str = "jellium-desktop";
 const LOG_FILE_NAME: &str = "jellium-desktop.log";
 
-#[derive(Default)]
 struct Overrides {
     config_dir: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
 }
 
-static OVERRIDES: OnceLock<Mutex<Overrides>> = OnceLock::new();
+static OVERRIDES: Mutex<Overrides> = Mutex::new(Overrides {
+    config_dir: None,
+    cache_dir: None,
+});
 
 fn overrides() -> MutexGuard<'static, Overrides> {
-    OVERRIDES
-        .get_or_init(|| Mutex::new(Overrides::default()))
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    OVERRIDES.lock()
 }
 
 pub fn set_config_dir_override(path: PathBuf) {
@@ -49,8 +47,9 @@ fn cache_override() -> Option<PathBuf> {
     overrides().cache_dir.clone()
 }
 
+#[cfg(not(windows))]
 fn env_or(var: &str, fallback: &str) -> String {
-    match env::var(var) {
+    match std::env::var(var) {
         Ok(v) if !v.is_empty() => v,
         _ => fallback.to_string(),
     }
@@ -112,7 +111,7 @@ pub fn mpv_home() -> PathBuf {
 
 #[cfg(unix)]
 pub fn runtime_dir() -> io::Result<PathBuf> {
-    if let Ok(dir) = env::var("XDG_RUNTIME_DIR")
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
         && !dir.is_empty()
     {
         return Ok(ensure(PathBuf::from(dir)));

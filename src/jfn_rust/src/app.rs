@@ -3,6 +3,7 @@
 
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::ptr;
+use std::time::Duration;
 
 use clap::Parser;
 use jfn_cef::{APP_VERSION_FULL, cef_version};
@@ -27,6 +28,22 @@ fn video_bg_set(rgb: u32) {
 
 fn video_bg_get() -> u32 {
     VIDEO_BG.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// mpv background applied over the user's mpv.conf color for the app's
+/// lifetime before the theme rotator takes over.
+const STARTUP_BG_HEX: &str = "#101010";
+
+/// Set once the startup background override has replaced the user's color.
+static STARTUP_BG_APPLIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Shared-texture decision `CefInitialize` was given.
+static SHARED_TEXTURES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether CEF was initialized with shared-texture compositing.
+fn shared_textures() -> bool {
+    SHARED_TEXTURES.load(std::sync::atomic::Ordering::Acquire)
 }
 
 pub(crate) const DEFAULT_LOG_FILTER: &str = "info";
@@ -99,12 +116,23 @@ fn log_mpv_versions() {
     }
 }
 
-fn install_mpv_close_binding(raw: *mut jfn_mpv::sys::mpv_handle) {
+/// Restores the builtin CLOSE_WIN -> quit binding that
+/// `input-default-bindings=no` drops. Async: the boot path never parks on
+/// mpv's core.
+fn install_mpv_close_binding() {
     let kb = cs("keybind");
     let name = cs("CLOSE_WIN");
     let action = cs("quit");
-    let argv = [kb.as_ptr(), name.as_ptr(), action.as_ptr(), ptr::null()];
-    unsafe { jfn_mpv::sys::mpv_command(raw, argv.as_ptr() as *mut *const c_char) };
+    let argv = [kb.as_ptr(), name.as_ptr(), action.as_ptr()];
+    unsafe { jfn_mpv::api::jfn_mpv_command_async(argv.as_ptr(), argv.len()) };
+}
+
+/// Wake any thread parked in `mpv_wait_event` whenever a host publishes a
+/// window change, so the VO wait re-reads the readiness inputs mpv never
+/// reports: `MpvHost::host_ready` and the host-owned extent on backends that
+/// own their toplevel.
+fn wake_mpv_on_window_change() {
+    jfn_platform_abi::subscribe_window_changed(jfn_mpv::api::jfn_mpv_wakeup);
 }
 
 fn setup_mpv_environment() {
@@ -199,6 +227,7 @@ struct MpvInitOptions<'a> {
     boot_geometry: Option<&'a str>,
     boot_force_position: bool,
     boot_window_max: bool,
+    embed_wid: Option<i64>,
     hwdec: &'a str,
     audio_passthrough: &'a str,
     audio_exclusive: bool,
@@ -229,6 +258,7 @@ fn init_mpv_handle(opts: MpvInitOptions<'_>) -> *mut jfn_mpv::sys::mpv_handle {
             channels_c.as_ptr()
         },
         geometry: geometry_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+        wid: opts.embed_wid.unwrap_or(0),
         force_window_position: opts.boot_force_position,
         window_maximized_at_boot: opts.boot_window_max,
         mpv_log_level: mpv_log_level_c.as_ptr(),
@@ -240,64 +270,47 @@ fn init_mpv_handle(opts: MpvInitOptions<'_>) -> *mut jfn_mpv::sys::mpv_handle {
 /// Blocks until the window source has a usable extent. Returns false on
 /// a fatal mpv event (shutdown before the VO came up).
 fn wait_for_vo_window() -> bool {
-    let want_max = {
-        let g = jfn_config::window_geometry();
-        g.maximized
-    };
     tracing::info!(target: "Main", "Waiting for mpv window...");
+    let started = std::time::Instant::now();
 
-    let mut need_max = want_max;
     let mut fatal = false;
 
     // The platform owns the wait strategy; this pump owns all mpv event
-    // handling. It drains everything mpv has queued without blocking —
-    // consume_vo_event folds property changes into the ingest layer; a
-    // fatal event bails out of jfn_app_main — then, when the platform's
-    // strategy is the generic blocking wait (`may_block`), parks in mpv
-    // until the next wakeup.
-    plat().mpv_host().run_vo_wait(&mut |may_block| {
+    // handling. It drains everything mpv has queued without blocking, then,
+    // when the platform's strategy grants a block budget, parks in mpv for at
+    // most that long.
+    plat().mpv_host().run_vo_wait(&mut |budget: Duration| {
         loop {
-            match jfn_mpv::api::wait_event_owned(0.0) {
-                jfn_mpv::api::WaitEvent::None => {
-                    break;
-                }
-                jfn_mpv::api::WaitEvent::LogMessage(m) => {
-                    jfn_mpv::forward_log_to_tracing(&m);
-                    continue;
-                }
-                jfn_mpv::api::WaitEvent::Event(
-                    jfn_mpv::Event::Shutdown | jfn_mpv::Event::EndFile(_),
-                ) => {
+            match consume_boot_event(jfn_mpv::api::wait_event_owned(0.0)) {
+                BootEvent::Idle => break,
+                BootEvent::Fatal => {
                     fatal = true;
                     return false;
                 }
-                jfn_mpv::api::WaitEvent::Event(event) => {
-                    consume_vo_event(&event);
-                }
+                BootEvent::Consumed => {}
             }
         }
-        if vo_ready(&mut need_max) {
+        if boot_ready() {
             return false;
         }
-        if may_block {
-            match jfn_mpv::api::wait_event_owned(-1.0) {
-                jfn_mpv::api::WaitEvent::None => {}
-                jfn_mpv::api::WaitEvent::LogMessage(m) => jfn_mpv::forward_log_to_tracing(&m),
-                jfn_mpv::api::WaitEvent::Event(
-                    jfn_mpv::Event::Shutdown | jfn_mpv::Event::EndFile(_),
-                ) => {
-                    fatal = true;
-                    return false;
-                }
-                jfn_mpv::api::WaitEvent::Event(event) => {
-                    consume_vo_event(&event);
-                }
-            }
+        if !budget.is_zero()
+            && matches!(
+                consume_boot_event(jfn_mpv::api::wait_event_owned(budget.as_secs_f64())),
+                BootEvent::Fatal
+            )
+        {
+            fatal = true;
+            return false;
         }
         true
     });
 
-    !fatal
+    if fatal {
+        return false;
+    }
+    tracing::info!(target: "Main",
+        "mpv window ready in {} ms", started.elapsed().as_millis());
+    true
 }
 
 fn publish_device_profile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) {
@@ -331,18 +344,28 @@ fn publish_device_profile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) {
     }
 }
 
-fn initialize_cef(ba: &BootArgs, use_shared_textures: bool) -> bool {
+/// `CefInitialize` with the flags this boot resolved, recording the
+/// shared-texture decision for [`shared_textures`]. A call after a successful
+/// one returns true without re-entering CEF.
+fn ensure_cef_initialized(ba: &BootArgs) -> bool {
+    if CEF_INITED.load(std::sync::atomic::Ordering::Acquire) {
+        return true;
+    }
+    let use_shared_textures = plat().shared_texture_supported() && !ba.disable_gpu_compositing;
+    SHARED_TEXTURES.store(use_shared_textures, std::sync::atomic::Ordering::Release);
     jfn_cef::ffi::jfn_cef_set_log_severity(cef_severity_for_cef_filter());
     jfn_cef::ffi::jfn_cef_set_remote_debugging_port(ba.remote_debugging_port);
     jfn_cef::ffi::jfn_cef_set_disable_gpu_compositing(!use_shared_textures);
     jfn_cef::ffi::jfn_cef_set_platform_switches(plat().display());
     tracing::info!(target: "Main", "[FLOW] calling CefInitialize...");
+    let started = std::time::Instant::now();
     if !jfn_cef::ffi::jfn_cef_initialize() {
         tracing::error!(target: "Main", "CefInitialize failed");
         return false;
     }
     CEF_INITED.store(true, std::sync::atomic::Ordering::Release);
-    tracing::info!(target: "Main", "[FLOW] CefInitialize returned ok");
+    tracing::info!(target: "Main",
+        "[FLOW] CefInitialize returned ok in {} ms", started.elapsed().as_millis());
     true
 }
 
@@ -428,23 +451,19 @@ fn boot_mpv_reconcile(mpv_raw: *mut jfn_mpv::sys::mpv_handle) -> f64 {
             &mut display_hidpi_scale as *mut f64 as *mut std::ffi::c_void,
         );
     }
-    let mut fs_flag: c_int = 0;
-    unsafe {
-        let name = cs("fullscreen");
-        jfn_mpv::sys::mpv_get_property(
-            mpv_raw,
-            name.as_ptr(),
-            jfn_mpv::sys::mpv_format::MPV_FORMAT_FLAG,
-            &mut fs_flag as *mut c_int as *mut std::ffi::c_void,
-        );
-    }
     jfn_playback::ingest_driver::jfn_playback_seed_display_hz_sync();
     let hz = jfn_playback::ingest_driver::jfn_playback_display_hz();
-    tracing::info!(target: "Main",
-        "[FLOW] display-hidpi-scale={display_hidpi_scale} fullscreen={fs_flag} display-hz={hz}");
-
     let saved = jfn_config::window_geometry();
-    let locked = fs_flag != 0 || jfn_playback::ingest_driver::jfn_playback_window_maximized();
+    let snap = crate::window_geometry::controller().source().snapshot();
+    tracing::info!(target: "Main",
+        "[FLOW] display-hidpi-scale={display_hidpi_scale} fullscreen={} display-hz={hz}",
+        snap.fullscreen
+    );
+
+    // Saved intent, not an observation: the OS may still be applying the
+    // maximize, and a set_geometry landing mid-flight leaves mpv's stored
+    // window size disagreeing with the visible window.
+    let locked = saved.maximized || snap.fullscreen || snap.maximized;
     if let Some(physical) = plat().reconcile_mpv_size(
         display_hidpi_scale,
         saved.scale,
@@ -596,22 +615,33 @@ async fn notify_running(instance: &Instance) -> c_int {
 }
 
 fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
-    setup_mpv_environment();
-
+    // Boot geometry resolves before the host prepare so its display probes
+    // hit the real server, not the mpv proxy the prepare may install.
     let boot = crate::window_geometry::controller().boot();
     plat().apply_boot_geometry(&boot);
+
+    setup_mpv_environment();
+
+    // Hosts that own their toplevel create it here, before mpv init, so its
+    // window ID can be handed to mpv as `wid`.
+    plat().mpv_host().ensure_host_window();
 
     let mpv_log_level = mpv_log_level_from_filter();
 
     // mpv's --geometry takes physical pixels (see m_geometry_apply in
-    // third_party/mpv/options/m_option.c).
+    // third_party/mpv/options/m_option.c). Window boot options only apply
+    // when mpv owns the window; toplevel-owning backends size and
+    // position/maximize the host window themselves.
     let backend_byte: u8 = plat().display() as u8;
     let boot_mpv_geometry = plat().boot_mpv_geometry(&boot);
+    let mpv_owns_window = boot_mpv_geometry.is_some();
+    let mpv_started = std::time::Instant::now();
     let raw = init_mpv_handle(MpvInitOptions {
         backend_byte,
         boot_geometry: boot_mpv_geometry.as_deref(),
-        boot_force_position: boot.force_position(),
-        boot_window_max: boot.maximized(),
+        boot_force_position: mpv_owns_window && boot.force_position(),
+        boot_window_max: mpv_owns_window && boot.maximized(),
+        embed_wid: plat().mpv_host().embed_wid(),
         hwdec: &opts.hwdec,
         audio_passthrough: &opts.audio_passthrough,
         audio_exclusive: opts.audio_exclusive,
@@ -622,39 +652,44 @@ fn run_app(instance: &Instance, opts: StartupOptions) -> c_int {
         tracing::error!(target: "Main", "mpv handle init failed");
         return 1;
     }
+    tracing::info!(target: "Main",
+        "[FLOW] mpv handle initialized in {} ms", mpv_started.elapsed().as_millis());
 
     if !jfn_playback::ingest_driver::jfn_playback_observe_mpv_properties(backend_byte) {
         tracing::error!(target: "Main", "observe_mpv_properties failed");
         return 1;
     }
 
-    // force-window=yes (not "immediate") defers VO creation so the user's
-    // mpv.conf color never flashes before this override is applied.
-    let user_bg = jfn_mpv::api::jfn_mpv_get_background_color();
-    video_bg_set(user_bg);
-    {
-        let hex = format!("#{:06x}", user_bg);
-        tracing::info!(target: "Main", "video bg captured: {hex}");
-    }
-    let startup_bg = cs("#101010");
-    unsafe { jfn_mpv::api::jfn_mpv_set_background_color_hex(startup_bg.as_ptr()) };
-
-    log_mpv_versions();
+    // force-window=yes keeps VO creation on mpv's core thread. The user's
+    // mpv.conf color is only known after mpv_initialize parsed the config, so
+    // the capture is async: the reply lands in the boot pump, which writes the
+    // override and gates boot readiness on it.
+    jfn_mpv::api::jfn_mpv_request_background_color();
 
     // input-default-bindings=no drops the builtin CLOSE_WIN -> quit binding;
     // the WM close button needs it back.
-    install_mpv_close_binding(raw);
+    install_mpv_close_binding();
 
-    plat().mpv_host().ensure_host_window();
-
-    if !wait_for_vo_window() {
-        return 0;
-    }
+    wake_mpv_on_window_change();
 
     let boot_args = BootArgs {
         disable_gpu_compositing: opts.disable_gpu_compositing,
         remote_debugging_port: opts.remote_debugging_port,
     };
+
+    // CEF's process bring-up needs nothing mpv owns; where the platform
+    // allows it, it runs while the core thread builds the VO and its GPU
+    // context instead of after.
+    if plat().cef_init_precedes_mpv_window() && !ensure_cef_initialized(&boot_args) {
+        return 1;
+    }
+
+    if !wait_for_vo_window() {
+        return 0;
+    }
+
+    log_mpv_versions();
+
     let rc = unsafe { run_with_cef(&boot_args, instance) };
     if rc != 0 {
         return rc;
@@ -697,33 +732,75 @@ fn mpv_log_level_from_filter() -> &'static str {
     }
 }
 
-fn boot_window_size() -> Option<(i32, i32)> {
+/// What one drained libmpv event means for the boot wait.
+enum BootEvent {
+    /// The queue was empty, or the parked wait timed out.
+    Idle,
+    /// mpv is going away before its window came up.
+    Fatal,
+    /// Folded into boot state.
+    Consumed,
+}
+
+/// Log messages reach tracing, the background-color reply applies the startup
+/// override, every other event reaches the ingest layer.
+fn consume_boot_event(event: jfn_mpv::api::WaitEvent) -> BootEvent {
+    match event {
+        jfn_mpv::api::WaitEvent::None => BootEvent::Idle,
+        jfn_mpv::api::WaitEvent::LogMessage(m) => {
+            jfn_mpv::forward_log_to_tracing(&m);
+            BootEvent::Consumed
+        }
+        jfn_mpv::api::WaitEvent::Event(jfn_mpv::Event::Shutdown | jfn_mpv::Event::EndFile(_)) => {
+            BootEvent::Fatal
+        }
+        jfn_mpv::api::WaitEvent::Event(jfn_mpv::Event::GetPropertyReply {
+            reply: jfn_mpv::api::BACKGROUND_COLOR_REPLY,
+            ref value,
+            ..
+        }) => {
+            apply_startup_background(value);
+            BootEvent::Consumed
+        }
+        jfn_mpv::api::WaitEvent::Event(event) => {
+            let scale_raw = plat().get_scale();
+            let scale = if scale_raw > 0.0 { scale_raw } else { 1.0 };
+            jfn_playback::ingest_driver::jfn_playback_ingest_mpv_event_owned(
+                &event,
+                scale,
+                plat().mpv_host().logical_content_size(),
+            );
+            BootEvent::Consumed
+        }
+    }
+}
+
+/// Stores the user's color for the theme rotator, then writes
+/// [`STARTUP_BG_HEX`] in its place. Latches [`STARTUP_BG_APPLIED`] even when
+/// the reply carried no value.
+fn apply_startup_background(value: &jfn_mpv::PropertyValue) {
+    if let Some(user_bg) = jfn_mpv::api::background_color_from_reply(value) {
+        video_bg_set(user_bg);
+        tracing::info!(target: "Main", "video bg captured: #{user_bg:06x}");
+    }
+    let startup_bg = cs(STARTUP_BG_HEX);
+    unsafe { jfn_mpv::api::jfn_mpv_set_background_color_hex(startup_bg.as_ptr()) };
+    STARTUP_BG_APPLIED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Ready once the window authority reports an extent, the host's own startup
+/// gate is open, and the startup background override has landed. The window's
+/// mode is never a boot precondition: where mpv owns the toplevel the
+/// `window-maximized` report is an echo of the boot option, and where a host
+/// owns the toplevel the WM/compositor may decline the maximize outright.
+fn boot_ready() -> bool {
     crate::window_geometry::controller()
         .source()
         .snapshot()
         .extent
-        .map(|e| (e.physical().w, e.physical().h))
-}
-
-fn consume_vo_event(event: &jfn_mpv::Event) {
-    let scale_raw = plat().get_scale();
-    let scale = if scale_raw > 0.0 { scale_raw } else { 1.0 };
-    jfn_playback::ingest_driver::jfn_playback_ingest_mpv_event_owned(
-        event,
-        scale,
-        plat().mpv_host().logical_content_size(),
-    );
-}
-
-fn vo_ready(need_max: &mut bool) -> bool {
-    let reported_max = plat()
-        .mpv_host()
-        .window_maximized()
-        .unwrap_or_else(jfn_playback::ingest_driver::jfn_playback_window_maximized);
-    if reported_max {
-        *need_max = false;
-    }
-    boot_window_size().is_some() && !*need_max && plat().mpv_host().host_ready()
+        .is_some()
+        && plat().mpv_host().host_ready()
+        && STARTUP_BG_APPLIED.load(std::sync::atomic::Ordering::Acquire)
 }
 
 // =====================================================================
@@ -814,14 +891,13 @@ unsafe fn run_with_cef(ba: &BootArgs, instance: &Instance) -> c_int {
     publish_device_profile(mpv_raw);
 
     // 5. CEF init flags + initialise.
-    let use_shared_textures = plat().shared_texture_supported() && !ba.disable_gpu_compositing;
-    if !initialize_cef(ba, use_shared_textures) {
+    if !ensure_cef_initialized(ba) {
         return 1;
     }
 
     let hz = boot_mpv_reconcile(mpv_raw);
 
-    let (manager_thread, main_layer) = init_main_browser(hz, use_shared_textures);
+    let (manager_thread, main_layer) = init_main_browser(hz, shared_textures());
 
     if !start_playback_coordination(instance) {
         return 1;
